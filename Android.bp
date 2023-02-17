@@ -16,7 +16,7 @@ cc_defaults {
     name: "dwarves_defaults",
     cflags: [
         "-DDWARVES_MAJOR_VERSION=1",
-        "-DDWARVES_MINOR_VERSION=19",
+        "-DDWARVES_MINOR_VERSION=23",
         "-D_GNU_SOURCE",
         "-Wno-deprecated-declarations",
         "-Wno-pointer-arith",
@@ -26,7 +26,6 @@ cc_defaults {
     visibility: [":__subpackages__"],
     compile_multilib: "64",
 }
-
 
 cc_library_host_static {
     name: "libdwarves",
@@ -52,7 +51,6 @@ cc_library_host_static {
         "libz",
     ],
 }
-
 
 cc_binary_host {
     name: "pahole",
