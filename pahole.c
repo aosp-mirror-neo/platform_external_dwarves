@@ -24,6 +24,7 @@
 
 #include "dwarves_reorganize.h"
 #include "dwarves.h"
+#include "dwarves_emit.h"
 #include "dutil.h"
 //#include "ctf_encoder.h" FIXME: disabled, probably its better to move to Oracle's libctf
 #include "btf_encoder.h"
@@ -80,6 +81,9 @@ static const char *class_name;
 static LIST_HEAD(class_names);
 static char separator = '\t';
 
+static bool compilable;
+static struct type_emissions emissions;
+
 static struct conf_fprintf conf = {
 	.emit_stats = 1,
 };
@@ -100,11 +104,10 @@ struct structure {
 
 static struct structure *structure__new(struct class *class, struct cu *cu, uint32_t id)
 {
-	struct structure *st = malloc(sizeof(*st));
+	struct structure *st = zalloc(sizeof(*st));
 
 	if (st != NULL) {
 		st->nr_files   = 1;
-		st->nr_methods = 0;
 		st->class      = class;
 		st->cu	       = cu;
 		st->id	       = id;
@@ -124,6 +127,79 @@ static void structure__delete(struct structure *st)
 static struct rb_root structures__tree = RB_ROOT;
 static LIST_HEAD(structures__list);
 static pthread_mutex_t structures_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static struct {
+	char *str;
+	int  *entries;
+	int  nr_entries;
+	bool exclude;
+} languages;
+
+static int lang_id_cmp(const void *pa, const void *pb)
+{
+	int a = *(int *)pa,
+	    b = *(int *)pb;
+	return a - b;
+}
+
+static int parse_languages(void)
+{
+	int nr_allocated = 4;
+	char *lang = languages.str;
+
+	languages.entries = zalloc(sizeof(int) * nr_allocated);
+	if (languages.entries == NULL)
+		goto out_enomem;
+
+	while (1) {
+		char *sep = strchr(lang, ',');
+
+		if (sep)
+			*sep = '\0';
+
+		int id = lang__str2int(lang);
+
+		if (sep)
+			*sep = ',';
+
+		if (id < 0) {
+			fprintf(stderr, "pahole: unknown language \"%s\"\n", lang);
+			goto out_free;
+		}
+
+		if (languages.nr_entries >= nr_allocated) {
+			nr_allocated *= 2;
+			int *entries = realloc(languages.entries, nr_allocated);
+
+			if (entries == NULL)
+				goto out_enomem;
+
+			languages.entries = entries;
+		}
+
+		languages.entries[languages.nr_entries++] = id;
+
+		if (!sep)
+			break;
+
+		lang = sep + 1;
+	}
+
+	qsort(languages.entries, languages.nr_entries, sizeof(int), lang_id_cmp);
+
+	return 0;
+out_enomem:
+	fprintf(stderr, "pahole: not enough memory to parse --lang\n");
+out_free:
+	zfree(&languages.entries);
+	languages.nr_entries = 0;
+	return -1;
+}
+
+static bool languages__in(int lang)
+{
+	return bsearch(&lang, languages.entries, languages.nr_entries, sizeof(int), lang_id_cmp) != NULL;
+}
 
 static int type__compare_members_types(struct type *a, struct cu *cu_a, struct type *b, struct cu *cu_b)
 {
@@ -437,7 +513,14 @@ static void class_formatter(struct class *class, struct cu *cu, uint32_t id)
 	} else
 		conf.prefix = conf.suffix = NULL;
 
-	tag__fprintf(tag, cu, &conf, stdout);
+	if (compilable) {
+		if (type__emit_definitions(tag, cu, &emissions, stdout)) {
+			tag__fprintf(tag, cu, &conf, stdout);
+			putchar(';');
+		}
+	} else {
+		tag__fprintf(tag, cu, &conf, stdout);
+	}
 
 	putchar('\n');
 }
@@ -590,16 +673,24 @@ static void print_ordered_classes(void)
 	if (!need_resort) {
 		__print_ordered_classes(&structures__tree);
 	} else {
-		struct rb_root resorted = RB_ROOT;
+		structures__tree = RB_ROOT;
 
-		resort_classes(&resorted, &structures__list);
-		__print_ordered_classes(&resorted);
+		resort_classes(&structures__tree, &structures__list);
+		__print_ordered_classes(&structures__tree);
 	}
 }
 
 
 static struct cu *cu__filter(struct cu *cu)
 {
+	if (languages.nr_entries) {
+		bool in = languages__in(cu->language);
+
+		if ((!in && !languages.exclude) ||
+		    (in && languages.exclude))
+			return NULL;
+	}
+
 	if (cu__exclude_prefix != NULL &&
 	    (cu->name == NULL ||
 	     strncmp(cu__exclude_prefix, cu->name,
@@ -781,19 +872,19 @@ static void class__resize_LP(struct tag *tag, struct cu *cu)
 		    	continue;
 
 		type = cu__type(cu, tag_pos->type);
-		tag__assert_search_result(type);
+		tag__assert_search_result(type, tag_pos->tag, class_member__name(tag__class_member(tag_pos)));
 		if (type->tag == DW_TAG_array_type) {
 			int i;
 			for (i = 0; i < tag__array_type(type)->dimensions; ++i)
 				array_multiplier *= tag__array_type(type)->nr_entries[i];
 
 			type = cu__type(cu, type->type);
-			tag__assert_search_result(type);
+			tag__assert_search_result(type, tag_pos->tag, class_member__name(tag__class_member(tag_pos)));
 		}
 
 		if (tag__is_typedef(type)) {
 			type = tag__follow_typedef(type, cu);
-			tag__assert_search_result(type);
+			tag__assert_search_result(type, tag_pos->tag, class_member__name(tag__class_member(tag_pos)));
 		}
 
 		switch (type->tag) {
@@ -863,7 +954,7 @@ static void union__find_new_size(struct tag *tag, struct cu *cu)
 		    	continue;
 
 		type = cu__type(cu, tag_pos->type);
-		tag__assert_search_result(type);
+		tag__assert_search_result(type, tag_pos->tag, class_member__name(tag__class_member(tag_pos)));
 		if (tag__is_typedef(type))
 			type = tag__follow_typedef(type, cu);
 
@@ -1006,7 +1097,7 @@ static void print_structs_with_pointer_to(struct cu *cu, uint32_t type)
 		type__for_each_member(&pos->type, pos_member) {
 			struct tag *ctype = cu__type(cu, pos_member->tag.type);
 
-			tag__assert_search_result(ctype);
+			tag__assert_search_result(ctype, pos_member->tag.tag, class_member__name(pos_member));
 			if (!tag__is_pointer_to(ctype, type))
 				continue;
 
@@ -1090,6 +1181,13 @@ static void print_containers(struct cu *cu, uint32_t type, int ident)
 	}
 }
 
+static int
+libbpf_print_all_levels(__maybe_unused enum libbpf_print_level level,
+			const char *format, va_list args)
+{
+	return vfprintf(stderr, format, args);
+}
+
 /* Name and version of program.  */
 ARGP_PROGRAM_VERSION_HOOK_DEF = dwarves_print_version;
 
@@ -1127,6 +1225,13 @@ ARGP_PROGRAM_VERSION_HOOK_DEF = dwarves_print_version;
 #define ARGP_skip_encoding_btf_decl_tag 331
 #define ARGP_skip_missing          332
 #define ARGP_skip_encoding_btf_type_tag 333
+#define ARGP_compile		   334
+#define ARGP_languages		   335
+#define ARGP_languages_exclude	   336
+#define ARGP_skip_encoding_btf_enum64 337
+#define ARGP_skip_emitting_atomic_typedefs 338
+#define ARGP_btf_gen_optimized  339
+#define ARGP_skip_encoding_btf_inconsistent_proto 340
 
 static const struct argp_option pahole__options[] = {
 	{
@@ -1456,6 +1561,11 @@ static const struct argp_option pahole__options[] = {
 		.doc  = "Allow using all the BTF features supported by pahole."
 	},
 	{
+		.name = "compile",
+		.key  = ARGP_compile,
+		.doc  = "Emit compilable types"
+	},
+	{
 		.name = "structs",
 		.key  = ARGP_just_structs,
 		.doc  = "Show just structs",
@@ -1511,6 +1621,38 @@ static const struct argp_option pahole__options[] = {
 		.name = "skip_encoding_btf_type_tag",
 		.key  = ARGP_skip_encoding_btf_type_tag,
 		.doc  = "Do not encode TAGs in BTF."
+	},
+	{
+		.name = "lang",
+		.key  = ARGP_languages,
+		.arg  = "LANGUAGES",
+		.doc  = "Only consider compilation units written in these languages"
+	},
+	{
+		.name = "lang_exclude",
+		.key  = ARGP_languages_exclude,
+		.arg  = "LANGUAGES",
+		.doc  = "Don't consider compilation units written in these languages"
+	},
+	{
+		.name = "skip_encoding_btf_enum64",
+		.key  = ARGP_skip_encoding_btf_enum64,
+		.doc  = "Do not encode ENUM64sin BTF."
+	},
+	{
+		.name = "skip_emitting_atomic_typedefs",
+		.key  = ARGP_skip_emitting_atomic_typedefs,
+		.doc  = "Do not emit 'typedef _Atomic int atomic_int' & friends."
+	},
+	{
+		.name = "btf_gen_optimized",
+		.key  = ARGP_btf_gen_optimized,
+		.doc  = "Generate BTF for functions with optimization-related suffixes (.isra, .constprop)."
+	},
+	{
+		.name = "skip_encoding_btf_inconsistent_proto",
+		.key = ARGP_skip_encoding_btf_inconsistent_proto,
+		.doc = "Skip functions that have multiple inconsistent function prototypes sharing the same name, or that use unexpected registers for parameter values."
 	},
 	{
 		.name = NULL,
@@ -1581,7 +1723,9 @@ static error_t pahole__options_parser(int key, char *arg,
 		  formatter = NULL;			break;
 	case 't': separator = arg[0];			break;
 	case 'u': defined_in = 1;			break;
-	case 'V': global_verbose = 1;			break;
+	case 'V': global_verbose = 1;
+		  libbpf_set_print(libbpf_print_all_levels);
+		  break;
 	case 'w': word_size = atoi(arg);		break;
 	case 'X': cu__exclude_prefix = arg;
 		  cu__exclude_prefix_len = strlen(cu__exclude_prefix);
@@ -1598,6 +1742,12 @@ static error_t pahole__options_parser(int key, char *arg,
 			formatter = class_name_formatter;
 		break;
 	// case 'Z': ctf_encode = 1;			break; // FIXME: Disabled
+	case ARGP_compile:
+		  compilable = true;
+                  type_emissions__init(&emissions, &conf);
+                  conf.no_semicolon = true;
+                  conf.strip_inline = true;
+		  break;
 	case ARGP_flat_arrays: conf.flat_arrays = 1;	break;
 	case ARGP_suppress_aligned_attribute:
 		conf.suppress_aligned_attribute = 1;	break;
@@ -1666,6 +1816,19 @@ static error_t pahole__options_parser(int key, char *arg,
 		conf_load.skip_missing = true;          break;
 	case ARGP_skip_encoding_btf_type_tag:
 		conf_load.skip_encoding_btf_type_tag = true;	break;
+	case ARGP_languages_exclude:
+		languages.exclude = true;
+		/* fallthru */
+	case ARGP_languages:
+		languages.str = arg;			break;
+	case ARGP_skip_encoding_btf_enum64:
+		conf_load.skip_encoding_btf_enum64 = true;	break;
+	case ARGP_skip_emitting_atomic_typedefs:
+		conf.skip_emitting_atomic_typedefs = true;	break;
+	case ARGP_btf_gen_optimized:
+		conf_load.btf_gen_optimized = true;		break;
+	case ARGP_skip_encoding_btf_inconsistent_proto:
+		conf_load.skip_encoding_btf_inconsistent_proto = true; break;
 	default:
 		return ARGP_ERR_UNKNOWN;
 	}
@@ -2108,7 +2271,7 @@ static struct type_instance *type_instance__new(struct type *type, struct cu *cu
 	if (type == NULL)
 		return NULL;
 
-	struct type_instance *instance = malloc(sizeof(*instance) + type->size);
+	struct type_instance *instance = zalloc(sizeof(*instance) + type->size);
 
 	if (instance) {
 		instance->type = type;
@@ -2574,7 +2737,7 @@ static int class_member_filter__parse(struct class_member_filter *filter, struct
 
 static struct class_member_filter *class_member_filter__new(struct type *type, char *sfilter)
 {
-	struct class_member_filter *filter = malloc(sizeof(*filter));
+	struct class_member_filter *filter = zalloc(sizeof(*filter));
 
 	if (filter && class_member_filter__parse(filter, type, sfilter)) {
 		free(filter);
@@ -2728,7 +2891,7 @@ static void prototype__delete(struct prototype *prototype)
 
 static struct tag_cu_node *tag_cu_node__new(struct tag *tag, struct cu *cu)
 {
-	struct tag_cu_node *tc = malloc(sizeof(*tc));
+	struct tag_cu_node *tc = zalloc(sizeof(*tc));
 
 	if (tc) {
 		tc->tc.tag = tag;
@@ -2798,8 +2961,75 @@ out:
 
 static struct type_instance *header;
 
+struct thread_data {
+	struct btf *btf;
+	struct btf_encoder *encoder;
+};
+
+static int pahole_threads_prepare(struct conf_load *conf, int nr_threads, void **thr_data)
+{
+	int i;
+	struct thread_data *threads = calloc(sizeof(struct thread_data), nr_threads);
+
+	for (i = 0; i < nr_threads; i++)
+		thr_data[i] = threads + i;
+
+	return 0;
+}
+
+static int pahole_thread_exit(struct conf_load *conf, void *thr_data)
+{
+	struct thread_data *thread = thr_data;
+
+	if (thread == NULL)
+		return 0;
+
+	/*
+	 * Here we will call btf__dedup() here once we extend
+	 * btf__dedup().
+	 */
+
+	return 0;
+}
+
+static int pahole_threads_collect(struct conf_load *conf, int nr_threads, void **thr_data,
+				  int error)
+{
+	struct thread_data **threads = (struct thread_data **)thr_data;
+	int i;
+	int err = 0;
+
+	if (error)
+		goto out;
+
+	for (i = 0; i < nr_threads; i++) {
+		/*
+		 * Merge content of the btf instances of worker threads to the btf
+		 * instance of the primary btf_encoder.
+                */
+		if (!threads[i]->btf)
+			continue;
+		err = btf_encoder__add_encoder(btf_encoder, threads[i]->encoder);
+		if (err < 0)
+			goto out;
+	}
+	err = 0;
+
+out:
+	for (i = 0; i < nr_threads; i++) {
+		if (threads[i]->encoder && threads[i]->encoder != btf_encoder) {
+			btf_encoder__delete(threads[i]->encoder);
+			threads[i]->encoder = NULL;
+		}
+	}
+	free(threads[0]);
+
+	return err;
+}
+
 static enum load_steal_kind pahole_stealer(struct cu *cu,
-					   struct conf_load *conf_load)
+					   struct conf_load *conf_load,
+					   void *thr_data)
 {
 	int ret = LSK__DELETE;
 
@@ -2818,6 +3048,7 @@ static enum load_steal_kind pahole_stealer(struct cu *cu,
 
 	if (btf_encode) {
 		static pthread_mutex_t btf_lock = PTHREAD_MUTEX_INITIALIZER;
+		struct btf_encoder *encoder;
 
 		pthread_mutex_lock(&btf_lock);
 		/*
@@ -2827,21 +3058,58 @@ static enum load_steal_kind pahole_stealer(struct cu *cu,
 		 * point we'll have cu->elf setup...
 		 */
 		if (!btf_encoder) {
+			/*
+			 * btf_encoder is the primary encoder.
+			 * And, it is used by the thread
+			 * create it.
+			 */
 			btf_encoder = btf_encoder__new(cu, detached_btf_filename, conf_load->base_btf, skip_encoding_btf_vars,
 						       btf_encode_force, btf_gen_floats, global_verbose);
-			if (btf_encoder == NULL) {
-				ret = LSK__STOP_LOADING;
-				goto out_btf;
+			if (btf_encoder && thr_data) {
+				struct thread_data *thread = thr_data;
+
+				thread->encoder = btf_encoder;
+				thread->btf = btf_encoder__btf(btf_encoder);
 			}
 		}
+		pthread_mutex_unlock(&btf_lock);
 
-		if (btf_encoder__encode_cu(btf_encoder, cu)) {
+		if (!btf_encoder) {
+			ret = LSK__STOP_LOADING;
+			goto out_btf;
+		}
+
+		/*
+		 * thr_data keeps per-thread data for worker threads.  Each worker thread
+		 * has an encoder.  The main thread will merge the data collected by all
+		 * these encoders to btf_encoder.  However, the first thread reaching this
+		 * function creates btf_encoder and reuses it as its local encoder.  It
+		 * avoids copying the data collected by the first thread.
+		 */
+		if (thr_data) {
+			struct thread_data *thread = thr_data;
+
+			if (thread->encoder == NULL) {
+				thread->encoder =
+					btf_encoder__new(cu, detached_btf_filename,
+							 NULL,
+							 skip_encoding_btf_vars,
+							 btf_encode_force,
+							 btf_gen_floats,
+							 global_verbose);
+				thread->btf = btf_encoder__btf(thread->encoder);
+			}
+			encoder = thread->encoder;
+		} else {
+			encoder = btf_encoder;
+		}
+
+		ret = btf_encoder__encode_cu(encoder, cu, conf_load);
+		if (ret < 0) {
 			fprintf(stderr, "Encountered error while encoding BTF.\n");
 			exit(1);
 		}
-		ret = LSK__DELETE;
 out_btf:
-		pthread_mutex_unlock(&btf_lock);
 		return ret;
 	}
 #if 0
@@ -2978,7 +3246,7 @@ out_btf:
 			 * We don't need to print it for every compile unit
 			 * but the previous options need
 			 */
-			tag__fprintf(class, cu, &conf, stdout);
+			formatter(tag__class(class), cu, class_id);
 			putchar('\n');
 		}
 	}
@@ -3149,6 +3417,9 @@ int main(int argc, char *argv[])
 		goto out;
 	}
 
+	if (languages.str && parse_languages())
+		return rc;
+
 	if (class_name != NULL && stats_formatter == nr_methods_formatter) {
 		fputs("pahole: -m/nr_methods doesn't work with --class/-C, it shows all classes and the number of its methods\n", stderr);
 		return rc;
@@ -3206,6 +3477,9 @@ int main(int argc, char *argv[])
 	memset(tab, ' ', sizeof(tab) - 1);
 
 	conf_load.steal = pahole_stealer;
+	conf_load.thread_exit = pahole_thread_exit;
+	conf_load.threads_prepare = pahole_threads_prepare;
+	conf_load.threads_collect = pahole_threads_collect;
 
 	// Make 'pahole --header type < file' a shorter form of 'pahole -C type --count 1 < file'
 	if (conf.header_type && !class_name && prettify_input) {
@@ -3292,7 +3566,7 @@ try_sole_arg_as_class_names:
 	type_instance__delete(header);
 	header = NULL;
 
-	if (btf_encode) {
+	if (btf_encode && btf_encoder) { // maybe all CUs were filtered out and thus we don't have an encoder?
 		err = btf_encoder__encode(btf_encoder);
 		if (err) {
 			fputs("Failed to encode BTF\n", stderr);

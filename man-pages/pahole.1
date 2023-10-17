@@ -110,6 +110,26 @@ comparable when using using multiple threads to load DWARF data, when the order
 that the types in the compile units is processed is not deterministic.
 
 .TP
+.B \-\-compile
+Generate compileable code, with all definitions for all types, i.e.:
+.PP
+.nf
+$ pahole --compile > vmlinux.h
+.fi
+
+Produces a header that can be included in a C source file and built. In
+the example provided it will use the BTF info if available, otherwise will
+look for a DWARF file matching the running kernel build-id.
+
+.TP
+.B \-\-skip_emitting_atomic_typedefs
+Do not emit 'typedef _Atomic int atomic_int' & friends when used with options
+like --compile. Use it if the compiler provides these already, as of circa
+2022 with gcc 12.2.1 those are not encoded in DWARF so to generate compilable
+code we need emit those typedefs for the atomic types used in the data structures
+being emitted from debugging information.
+
+.TP
 .B \-\-count=COUNT
 Pretty print the first COUNT records from input.
 
@@ -125,8 +145,8 @@ offset from the beginning of a struct is.
 .TP
 .B \-F, \-\-format_path
 Allows specifying a list of debugging formats to try, in order. Right now this
-includes "ctf" and "dwarf". The default format path used is equivalent to
-"-F dwarf,ctf".
+includes "btf", "ctf" and "dwarf". The default format path used is equivalent to
+"-F dwarf,btf,ctf".
 
 .TP
 .B \-\-hashbits=BITS
@@ -202,8 +222,16 @@ Do not encode VARs in BTF.
 Do not encode decl tags in BTF.
 
 .TP
+.B \-\-skip_encoding_btf_enum64
+Do not encode enum64 in BTF.
+
+.TP
 .B \-\-skip_encoding_btf_type_tag
 Do not encode type tags in BTF.
+
+.TP
+.B \-\-skip_encoding_btf_inconsistent_proto
+Do not encode functions with multiple inconsistent prototypes or unexpected register use for their parameters, where the registers used do not match calling conventions.
 
 .TP
 .B \-j, \-\-jobs=N
@@ -236,6 +264,10 @@ to "/sys/kernel/btf/vmlinux".
 .B \-\-btf_gen_floats
 Allow producing BTF_KIND_FLOAT entries in systems where the vmlinux DWARF
 information has float types.
+
+.TP
+.B \-\-btf_gen_optimized
+Generate BTF for functions with optimization-related suffixes (.isra, .constprop).
 
 .TP
 .B \-\-btf_gen_all
@@ -355,6 +387,26 @@ Exclude PREFIXed classes.
 .TP
 .B \-X, \-\-cu_exclude=PREFIX
 Exclude PREFIXed compilation units.
+
+.TP
+.B \-\-lang=languages
+Only process compilation units built from source code written in the specified languages.
+
+Supported languages:
+
+  ada83, ada95, asm, bliss, c, c89, c99, c11, c++, c++03, c++11, c++14, cobol74,
+  cobol85, d, dylan, fortran77, fortran90, fortran95, fortran03, fortran08,
+  go, haskell, java, julia, modula2, modula3, objc, objc++, ocaml, opencl,
+  pascal83, pli, python, renderscript, rust, swift, upc
+
+The linux kernel, for instance, is written in 'c89' circa 2022, use that in filters.
+
+.B \-\-lang_exclude=languages
+Don't process compilation units built from source code written in the specified languages.
+
+To filter out compilation units written in Rust, for instance, use:
+
+ pahole -j --btf_encode --lang_exclude rust
 
 .TP
 .B \-y, \-\-prefix_filter=PREFIX

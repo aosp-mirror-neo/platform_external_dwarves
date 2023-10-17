@@ -175,10 +175,10 @@ void tag__delete(struct tag *tag)
 	}
 }
 
-void tag__not_found_die(const char *file, int line, const char *func)
+void tag__not_found_die(const char *file, int line, const char *func, int tag, const char *name)
 {
-	fprintf(stderr, "%s::%s(%d): tag not found, please report to "
-			"acme@kernel.org\n", file, func, line);
+	fprintf(stderr, "%s::%s(%d, related to the type of tag DW_TAG_%s \"%s\"): tag not found, please report to "
+			"acme@kernel.org\n", file, func, line, dwarf_tag_name(tag), name);
 	exit(1);
 }
 
@@ -249,6 +249,29 @@ static struct ase_type_name_to_size {
 	{ .name = "_Float128",              .size = 128, },
 	{ .name = NULL },
 };
+
+bool base_type__language_defined(struct base_type *bt)
+{
+	int i = 0;
+	char bf[64];
+	const char *name;
+
+	if (bt->name_has_encoding)
+		name = bt->name;
+	else
+		name = base_type__name(bt, bf, sizeof(bf));
+
+	while (base_type_name_to_size_table[i].name != NULL) {
+		if (bt->name_has_encoding) {
+			if (strcmp(base_type_name_to_size_table[i].name, bt->name) == 0)
+				return true;
+		} else if (strcmp(base_type_name_to_size_table[i].name, name) == 0)
+			return true;
+		++i;
+	}
+
+	return false;
+}
 
 size_t base_type__name_to_size(struct base_type *bt, struct cu *cu)
 {
@@ -345,6 +368,7 @@ void __type__init(struct type *type)
 	type->sizeof_member = NULL;
 	type->member_prefix = NULL;
 	type->member_prefix_len = 0;
+	type->suffix_disambiguation = 0;
 }
 
 struct class_member *
@@ -387,7 +411,8 @@ reevaluate:
 		case DW_TAG_const_type:
 		case DW_TAG_typedef:
 		case DW_TAG_rvalue_reference_type:
-		case DW_TAG_volatile_type: {
+		case DW_TAG_volatile_type:
+		case DW_TAG_atomic_type: {
 			struct tag *tag = cu__type(cu, type->type);
 			if (tag == NULL) {
 				tag__id_not_found_fprintf(stderr, type->type);
@@ -624,7 +649,7 @@ struct cu *cu__new(const char *name, uint8_t addr_size,
 		   const unsigned char *build_id, int build_id_len,
 		   const char *filename, bool use_obstack)
 {
-	struct cu *cu = malloc(sizeof(*cu) + build_id_len);
+	struct cu *cu = zalloc(sizeof(*cu) + build_id_len);
 
 	if (cu != NULL) {
 		uint32_t void_id;
@@ -1111,6 +1136,7 @@ size_t tag__size(const struct tag *tag, const struct cu *cu)
 	case DW_TAG_reference_type:	return cu->addr_size;
 	case DW_TAG_base_type:		return base_type__size(tag);
 	case DW_TAG_enumeration_type:	return tag__type(tag)->size / 8;
+	case DW_TAG_subroutine_type:	return tag__ftype(tag)->byte_size ?: cu->addr_size;
 	}
 
 	if (tag->type == 0) { /* struct class: unions, structs */
@@ -1191,6 +1217,10 @@ void type__delete(struct type *type)
 		return;
 
 	type__delete_class_members(type);
+
+	if (type->suffix_disambiguation)
+		zfree(&type->namespace.name);
+
 	free(type);
 }
 
@@ -1210,6 +1240,9 @@ void enumeration__delete(struct type *type)
 		list_del_init(&pos->tag.node);
 		enumerator__delete(pos);
 	}
+
+	if (type->suffix_disambiguation)
+		zfree(&type->namespace.name);
 
 	free(type);
 }
@@ -1607,7 +1640,7 @@ void type__check_structs_at_unnatural_alignments(struct type *type, const struct
 			struct class *cls = tag__class(member_type);
 
 			cls->is_packed = true;
-			cls->type.packed_attributes_inferred = true;
+			cls->type.packed_attributes_inferred = 1;
 		}
        }
 }
@@ -1663,7 +1696,7 @@ bool class__infer_packed_attributes(struct class *cls, const struct cu *cu)
 		cls->is_packed = true;
 
 out:
-	ctype->packed_attributes_inferred = true;
+	ctype->packed_attributes_inferred = 1;
 
 	return cls->is_packed;
 }
@@ -1695,11 +1728,11 @@ void union__infer_packed_attributes(struct type *type, const struct cu *cu)
 			struct class *cls = tag__class(member_type);
 
 			cls->is_packed = true;
-			cls->type.packed_attributes_inferred = true;
+			cls->type.packed_attributes_inferred = 1;
 		}
 	}
 
-	type->packed_attributes_inferred = true;
+	type->packed_attributes_inferred = 1;
 }
 
 /** class__has_hole_ge - check if class has a hole greater or equal to @size
@@ -2077,6 +2110,172 @@ int cus__load_file(struct cus *cus, struct conf_load *conf,
 
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]) + __must_be_array(arr))
 
+#ifndef DW_LANG_C89
+#define DW_LANG_C89		0x0001
+#endif
+#ifndef DW_LANG_C
+#define DW_LANG_C		0x0002
+#endif
+#ifndef DW_LANG_Ada83
+#define DW_LANG_Ada83		0x0003
+#endif
+#ifndef DW_LANG_C_plus_plus
+#define DW_LANG_C_plus_plus	0x0004
+#endif
+#ifndef DW_LANG_Cobol74
+#define DW_LANG_Cobol74		0x0005
+#endif
+#ifndef DW_LANG_Cobol85
+#define DW_LANG_Cobol85		0x0006
+#endif
+#ifndef DW_LANG_Fortran77
+#define DW_LANG_Fortran77	0x0007
+#endif
+#ifndef DW_LANG_Fortran90
+#define DW_LANG_Fortran90	0x0008
+#endif
+#ifndef DW_LANG_Pascal83
+#define DW_LANG_Pascal83	0x0009
+#endif
+#ifndef DW_LANG_Modula2
+#define DW_LANG_Modula2		0x000a
+#endif
+#ifndef DW_LANG_Java
+#define DW_LANG_Java		0x000b
+#endif
+#ifndef DW_LANG_C99
+#define DW_LANG_C99		0x000c
+#endif
+#ifndef DW_LANG_Ada95
+#define DW_LANG_Ada95		0x000d
+#endif
+#ifndef DW_LANG_Fortran95
+#define DW_LANG_Fortran95	0x000e
+#endif
+#ifndef DW_LANG_PLI
+#define DW_LANG_PLI		0x000f
+#endif
+#ifndef DW_LANG_ObjC
+#define DW_LANG_ObjC		0x0010
+#endif
+#ifndef DW_LANG_ObjC_plus_plus
+#define DW_LANG_ObjC_plus_plus	0x0011
+#endif
+#ifndef DW_LANG_UPC
+#define DW_LANG_UPC		0x0012
+#endif
+#ifndef DW_LANG_D
+#define DW_LANG_D		0x0013
+#endif
+#ifndef DW_LANG_Python
+#define DW_LANG_Python		0x0014
+#endif
+#ifndef DW_LANG_OpenCL
+#define DW_LANG_OpenCL		0x0015
+#endif
+#ifndef DW_LANG_Go
+#define DW_LANG_Go		0x0016
+#endif
+#ifndef DW_LANG_Modula3
+#define DW_LANG_Modula3		0x0017
+#endif
+#ifndef DW_LANG_Haskell
+#define DW_LANG_Haskell		0x0018
+#endif
+#ifndef DW_LANG_C_plus_plus_03
+#define DW_LANG_C_plus_plus_03	0x0019
+#endif
+#ifndef DW_LANG_C_plus_plus_11
+#define DW_LANG_C_plus_plus_11	0x001a
+#endif
+#ifndef DW_LANG_OCaml
+#define DW_LANG_OCaml		0x001b
+#endif
+#ifndef DW_LANG_Rust
+#define DW_LANG_Rust		0x001c
+#endif
+#ifndef DW_LANG_C11
+#define DW_LANG_C11		0x001d
+#endif
+#ifndef DW_LANG_Swift
+#define DW_LANG_Swift		0x001e
+#endif
+#ifndef DW_LANG_Julia
+#define DW_LANG_Julia		0x001f
+#endif
+#ifndef DW_LANG_Dylan
+#define DW_LANG_Dylan		0x0020
+#endif
+#ifndef DW_LANG_C_plus_plus_14
+#define DW_LANG_C_plus_plus_14	0x0021
+#endif
+#ifndef DW_LANG_Fortran03
+#define DW_LANG_Fortran03	0x0022
+#endif
+#ifndef DW_LANG_Fortran08
+#define DW_LANG_Fortran08	0x0023
+#endif
+#ifndef DW_LANG_RenderScript
+#define DW_LANG_RenderScript	0x0024
+#endif
+#ifndef DW_LANG_BLISS
+#define DW_LANG_BLISS		0x0025
+#endif
+
+int lang__str2int(const char *lang)
+{
+	static const char *languages[] = {
+	[DW_LANG_Ada83]		 = "ada83",
+	[DW_LANG_Ada95]		 = "ada95",
+	[DW_LANG_BLISS]		 = "bliss",
+	[DW_LANG_C11]		 = "c11",
+	[DW_LANG_C89]		 = "c89",
+	[DW_LANG_C99]		 = "c99",
+	[DW_LANG_C]		 = "c",
+	[DW_LANG_Cobol74]	 = "cobol74",
+	[DW_LANG_Cobol85]	 = "cobol85",
+	[DW_LANG_C_plus_plus_03] = "c++03",
+	[DW_LANG_C_plus_plus_11] = "c++11",
+	[DW_LANG_C_plus_plus_14] = "c++14",
+	[DW_LANG_C_plus_plus]	 = "c++",
+	[DW_LANG_D]		 = "d",
+	[DW_LANG_Dylan]		 = "dylan",
+	[DW_LANG_Fortran03]	 = "fortran03",
+	[DW_LANG_Fortran08]	 = "fortran08",
+	[DW_LANG_Fortran77]	 = "fortran77",
+	[DW_LANG_Fortran90]	 = "fortran90",
+	[DW_LANG_Fortran95]	 = "fortran95",
+	[DW_LANG_Go]		 = "go",
+	[DW_LANG_Haskell]	 = "haskell",
+	[DW_LANG_Java]		 = "java",
+	[DW_LANG_Julia]		 = "julia",
+	[DW_LANG_Modula2]	 = "modula2",
+	[DW_LANG_Modula3]	 = "modula3",
+	[DW_LANG_ObjC]		 = "objc",
+	[DW_LANG_ObjC_plus_plus] = "objc++",
+	[DW_LANG_OCaml]		 = "ocaml",
+	[DW_LANG_OpenCL]	 = "opencl",
+	[DW_LANG_Pascal83]	 = "pascal83",
+	[DW_LANG_PLI]		 = "pli",
+	[DW_LANG_Python]	 = "python",
+	[DW_LANG_RenderScript]	 = "renderscript",
+	[DW_LANG_Rust]		 = "rust",
+	[DW_LANG_Swift]		 = "swift",
+	[DW_LANG_UPC]		 = "upc",
+	};
+
+	if (strcasecmp(lang, "asm") == 0)
+		return DW_LANG_Mips_Assembler;
+
+	// c89 is the first, bliss is the last, see /usr/include/dwarf.h
+	for (int id = DW_LANG_C89; id <= DW_LANG_BLISS; ++id)
+		if (languages[id] && strcasecmp(lang, languages[id]) == 0)
+			return id;
+
+	return -1;
+}
+
+
 static int sysfs__read_build_id(const char *filename, void *build_id, size_t size)
 {
 	int fd, err = -1;
@@ -2391,8 +2590,11 @@ int cus__load_files(struct cus *cus, struct conf_load *conf,
 	int i = 0;
 
 	while (filenames[i] != NULL) {
-		if (cus__load_file(cus, conf, filenames[i]))
+		int err = cus__load_file(cus, conf, filenames[i]);
+		if (err) {
+			errno = -err;
 			return -++i;
+		}
 		++i;
 	}
 
@@ -2408,12 +2610,9 @@ int cus__fprintf_load_files_err(struct cus *cus __maybe_unused, const char *tool
 
 struct cus *cus__new(void)
 {
-	struct cus *cus = malloc(sizeof(*cus));
+	struct cus *cus = zalloc(sizeof(*cus));
 
 	if (cus != NULL) {
-		cus->nr_entries  = 0;
-		cus->priv	 = NULL;
-		cus->loader_exit = NULL;
 		INIT_LIST_HEAD(&cus->cus);
 		pthread_mutex_init(&cus->mutex, NULL);
 	}

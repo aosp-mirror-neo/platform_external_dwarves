@@ -13,10 +13,12 @@
 #include "dwarves_emit.h"
 #include "dwarves.h"
 
-void type_emissions__init(struct type_emissions *emissions)
+void type_emissions__init(struct type_emissions *emissions, struct conf_fprintf *conf_fprintf)
 {
+	INIT_LIST_HEAD(&emissions->base_type_definitions);
 	INIT_LIST_HEAD(&emissions->definitions);
 	INIT_LIST_HEAD(&emissions->fwd_decls);
+	emissions->conf_fprintf = conf_fprintf;
 }
 
 static void type_emissions__add_definition(struct type_emissions *emissions,
@@ -37,7 +39,7 @@ static void type_emissions__add_fwd_decl(struct type_emissions *emissions,
 }
 
 struct type *type_emissions__find_definition(const struct type_emissions *emissions,
-					     const char *name)
+					     uint16_t tag, const char *name)
 {
 	struct type *pos;
 
@@ -45,9 +47,37 @@ struct type *type_emissions__find_definition(const struct type_emissions *emissi
 		return NULL;
 
 	list_for_each_entry(pos, &emissions->definitions, node)
-		if (type__name(pos) != NULL &&
+		if (type__tag(pos)->tag == tag &&
+		    type__name(pos) != NULL &&
 		    strcmp(type__name(pos), name) == 0)
 			return pos;
+
+	return NULL;
+}
+
+static bool type__can_have_shadow_definition(struct type *type)
+{
+	struct tag *tag = type__tag(type);
+
+	return tag__is_struct(tag) || tag__is_union(tag) || tag__is_enumeration(tag);
+}
+
+// Find if 'struct foo' is defined with a pre-existing 'enum foo', 'union foo', etc
+struct type *type_emissions__find_shadow_definition(const struct type_emissions *emissions,
+						    uint16_t tag, const char *name)
+{
+	struct type *pos;
+
+	if (name == NULL)
+		return NULL;
+
+	list_for_each_entry(pos, &emissions->definitions, node) {
+		if (type__tag(pos)->tag != tag &&
+		    type__name(pos) != NULL &&
+		    type__can_have_shadow_definition(pos) &&
+		    strcmp(type__name(pos), name) == 0)
+			return pos;
+	}
 
 	return NULL;
 }
@@ -82,7 +112,7 @@ static int enumeration__emit_definitions(struct tag *tag,
 		return 0;
 
 	/* Ok, lets look at the previous CUs: */
-	if (type_emissions__find_definition(emissions, type__name(etype)) != NULL) {
+	if (type_emissions__find_definition(emissions, DW_TAG_enumeration_type, type__name(etype)) != NULL) {
 		/*
 		 * Yes, so lets mark it visited on this CU too,
 		 * to speed up the lookup.
@@ -93,7 +123,13 @@ static int enumeration__emit_definitions(struct tag *tag,
 
 	enumeration__fprintf(tag, conf, fp);
 	fputs(";\n", fp);
-	type_emissions__add_definition(emissions, etype);
+
+	// See comment on enumeration__fprintf(), it seems this happens with DWARF as well
+	// or BTF doesn't have type->declaration set because DWARF didn't have it set.
+	// But we consider type->nr_members == 0 as just a forward declaration, so don't
+	// mark it as defined because we may need it to __really__ printf it later.
+	if (etype->nr_members != 0)
+		type_emissions__add_definition(emissions, etype);
 	return 1;
 }
 
@@ -111,7 +147,7 @@ static int typedef__emit_definitions(struct tag *tdef, struct cu *cu,
 		return 0;
 
 	/* Ok, lets look at the previous CUs: */
-	if (type_emissions__find_definition(emissions, type__name(def)) != NULL) {
+	if (type_emissions__find_definition(emissions, DW_TAG_typedef, type__name(def)) != NULL) {
 		/*
 		 * Yes, so lets mark it visited on this CU too,
 		 * to speed up the lookup.
@@ -121,9 +157,17 @@ static int typedef__emit_definitions(struct tag *tdef, struct cu *cu,
 	}
 
 	type = cu__type(cu, tdef->type);
-	tag__assert_search_result(type);
+	if (type == NULL) // void
+		goto emit;
 
 	switch (type->tag) {
+	case DW_TAG_atomic_type:
+		type = cu__type(cu, tdef->type);
+		if (type)
+			tag__emit_definitions(type, cu, emissions, fp);
+		else
+			fprintf(stderr, "%s: couldn't find the type pointed from _Atomic for '%s'\n", __func__, type__name(def));
+		break;
 	case DW_TAG_array_type:
 		tag__emit_definitions(type, cu, emissions, fp);
 		break;
@@ -165,9 +209,8 @@ static int typedef__emit_definitions(struct tag *tdef, struct cu *cu,
 		struct type *ctype = tag__type(type);
 
 		if (type__name(ctype) == NULL) {
-			if (type__emit_definitions(type, cu, emissions, fp))
-				type__emit(type, cu, "typedef",
-					   type__name(def), fp);
+			type__emit_definitions(type__tag(ctype), cu, emissions, fp);
+			type__emit(type__tag(ctype), cu, "typedef", type__name(def), fp);
 			goto out;
 		} else if (type__emit_definitions(type, cu, emissions, fp))
 			type__emit(type, cu, NULL, NULL, fp);
@@ -182,6 +225,7 @@ static int typedef__emit_definitions(struct tag *tdef, struct cu *cu,
 	 * will thus be emitted before the function typedef, making a no go to
 	 * redefine the typedef after struct __wait_queue.
 	 */
+emit:
 	if (!def->definition_emitted) {
 		typedef__fprintf(tdef, cu, NULL, fp);
 		fputs(";\n", fp);
@@ -218,6 +262,91 @@ static int type__emit_fwd_decl(struct type *ctype, struct type_emissions *emissi
 	return 1;
 }
 
+static struct base_type *base_type_emissions__find_definition(const struct type_emissions *emissions, const char *name)
+{
+	struct base_type *pos;
+
+	if (name == NULL)
+		return NULL;
+
+	list_for_each_entry(pos, &emissions->base_type_definitions, node)
+		if (strcmp(__base_type__name(pos), name) == 0)
+			return pos;
+
+	return NULL;
+}
+
+static void base_type_emissions__add_definition(struct type_emissions *emissions, struct base_type *type)
+{
+	type->definition_emitted = 1;
+	if (!list_empty(&type->node))
+		list_del(&type->node);
+	list_add_tail(&type->node, &emissions->base_type_definitions);
+}
+
+static const char *base_type__stdint2simple(const char *name)
+{
+	if (strcmp(name, "int32_t") == 0)
+		return "int";
+	if (strcmp(name, "int16_t") == 0)
+		return "short";
+	if (strcmp(name, "int8_t") == 0)
+		return "char";
+	if (strcmp(name, "int64_t") == 0)
+		return "long";
+	return name;
+}
+
+static int base_type__emit_definitions(struct base_type *type, struct type_emissions *emissions, FILE *fp)
+{
+#define base_type__prefix "atomic_"
+	const size_t prefixlen = sizeof(base_type__prefix) - 1;
+	const char *name = __base_type__name(type);
+
+	// See if it was already emitted in this CU
+	if (type->definition_emitted)
+		return 0;
+
+	// We're only emitting for "atomic_" prefixed base types
+	if (strncmp(name, base_type__prefix, prefixlen) != 0)
+		return 0;
+
+	// See if it was already emitted in another CU
+	if (base_type_emissions__find_definition(emissions, name)) {
+		type->definition_emitted = 1;
+		return 0;
+	}
+
+	const char *non_atomic_name = name + prefixlen;
+
+	fputs("typedef _Atomic", fp);
+
+	if (non_atomic_name[0] == 's' &&
+	    non_atomic_name[1] != 'i' && non_atomic_name[1] != 'h') // exclude atomic_size_t and atomic_short
+		fprintf(fp, " signed %s", non_atomic_name + 1);
+	else if (non_atomic_name[0] == 'l' && non_atomic_name[1] == 'l')
+		fprintf(fp, " long long");
+	else if (non_atomic_name[0] == 'u') {
+		fprintf(fp, " unsigned");
+		if (non_atomic_name[1] == 'l') {
+			fprintf(fp, " long");
+			if (non_atomic_name[2] == 'l')
+				fprintf(fp, " long");
+		} else
+			fprintf(fp, " %s", base_type__stdint2simple(non_atomic_name + 1));
+	} else if (non_atomic_name[0] == 'b')
+		fprintf(fp, " _Bool");
+	else
+		fprintf(fp, " %s", base_type__stdint2simple(non_atomic_name));
+
+	fprintf(fp, " %s;\n", name);
+
+	base_type_emissions__add_definition(emissions, type);
+	return 1;
+
+#undef base_type__prefix
+}
+
 static int tag__emit_definitions(struct tag *tag, struct cu *cu,
 				 struct type_emissions *emissions, FILE *fp)
 {
@@ -228,6 +357,10 @@ static int tag__emit_definitions(struct tag *tag, struct cu *cu,
 		return 0;
 next_indirection:
 	switch (type->tag) {
+	case DW_TAG_base_type:
+		if (emissions->conf_fprintf && emissions->conf_fprintf->skip_emitting_atomic_typedefs)
+			return 0;
+		return base_type__emit_definitions(tag__base_type(type), emissions, fp);
 	case DW_TAG_pointer_type:
 	case DW_TAG_reference_type:
 		pointer = 1;
@@ -235,6 +368,7 @@ next_indirection:
 	case DW_TAG_array_type:
 	case DW_TAG_const_type:
 	case DW_TAG_volatile_type:
+	case DW_TAG_atomic_type:
 		type = cu__type(cu, type->type);
 		if (type == NULL)
 			return 0;
@@ -299,13 +433,47 @@ int type__emit_definitions(struct tag *tag, struct cu *cu,
 		return 0;
 
 	/* Ok, lets look at the previous CUs: */
-	if (type_emissions__find_definition(emissions, type__name(ctype)) != NULL) {
+	if (type_emissions__find_definition(emissions, tag->tag, type__name(ctype)) != NULL) {
 		ctype->definition_emitted = 1;
 		return 0;
 	}
 
 	if (tag__is_typedef(tag))
 		return typedef__emit_definitions(tag, cu, emissions, fp);
+
+	/*
+	 * vmlinux.h:120298:8: error: ‘irte’ defined as wrong kind of tag
+	 *
+	 * If we have a 'struct foo' and we then find a 'union foo', which happens
+	 * twice in the Linux kernel, for instance, then we need to disambiguate by
+	 * adding a suffix to the second type with the same name.
+	 *
+	 * That is the strategy used in:
+	 *
+	 *    btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
+	 */
+	if (type__can_have_shadow_definition(ctype)) {
+		if (type_emissions__find_shadow_definition(emissions, tag->tag, type__name(ctype))) {
+			ctype->suffix_disambiguation = 1;
+
+			char *disambiguated_name;
+
+			if (asprintf(&disambiguated_name, "%s__%u", type__name(ctype), ctype->suffix_disambiguation) == -1) {
+				fprintf(stderr, "emit: Not enough memory to allocate disambiguated type name for '%s'\n",
+					type__name(ctype));
+			} else {
+				// Will be deleted in type__delete() on noticing ctype->suffix_disambiguation != 0
+				tag__namespace(tag)->name = disambiguated_name;
+
+				// Now look again if it was emitted in a previous CU with the disambiguated name
+				if (type_emissions__find_definition(emissions, tag->tag, type__name(ctype)) != NULL) {
+					ctype->definition_emitted = 1;
+					return 0;
+				}
+			}
+
+		}
+	}
 
 	type_emissions__add_definition(emissions, ctype);
 

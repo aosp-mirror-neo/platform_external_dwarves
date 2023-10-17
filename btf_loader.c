@@ -108,6 +108,7 @@ static struct base_type *base_type__new(const char *name, uint32_t attrs,
 		bt->is_bool = attrs & BTF_INT_BOOL;
 		bt->name_has_encoding = false;
 		bt->float_type = float_type;
+		INIT_LIST_HEAD(&bt->node);
 	}
 	return bt;
 }
@@ -312,6 +313,56 @@ out_free:
 	return -ENOMEM;
 }
 
+#if LIBBPF_MAJOR_VERSION >= 1
+static struct enumerator *enumerator__new64(const char *name, uint64_t value)
+{
+	struct enumerator *en = tag__alloc(sizeof(*en));
+
+	if (en != NULL) {
+		en->name = name;
+		en->value = value; // Value is already 64-bit, as this is used with DWARF as well
+		en->tag.tag = DW_TAG_enumerator;
+	}
+
+	return en;
+}
+
+static int create_new_enumeration64(struct cu *cu, const struct btf_type *tp, uint32_t id)
+{
+	struct btf_enum64 *ep = btf_enum64(tp);
+	uint16_t i, vlen = btf_vlen(tp);
+	struct type *enumeration = type__new(DW_TAG_enumeration_type,
+					     cu__btf_str(cu, tp->name_off),
+					     tp->size ? tp->size * 8 : (sizeof(int) * 8));
+
+	if (enumeration == NULL)
+		return -ENOMEM;
+
+	for (i = 0; i < vlen; i++) {
+		const char *name = cu__btf_str(cu, ep[i].name_off);
+		uint64_t value = btf_enum64_value(&ep[i]);
+		struct enumerator *enumerator = enumerator__new64(name, value);
+
+		if (enumerator == NULL)
+			goto out_free;
+
+		enumeration__add(enumeration, enumerator);
+	}
+
+	cu__add_tag_with_id(cu, &enumeration->namespace.tag, id);
+
+	return 0;
+out_free:
+	enumeration__delete(enumeration);
+	return -ENOMEM;
+}
+#else
+static int create_new_enumeration64(struct cu *cu __maybe_unused, const struct btf_type *tp __maybe_unused, uint32_t id __maybe_unused)
+{
+	return -ENOTSUP;
+}
+#endif
+
 static int create_new_subroutine_type(struct cu *cu, const struct btf_type *tp, uint32_t id)
 {
 	struct ftype *proto = tag__alloc(sizeof(*proto));
@@ -378,10 +429,11 @@ static int create_new_tag(struct cu *cu, int type, const struct btf_type *tp, ui
 		return -ENOMEM;
 
 	switch (type) {
-	case BTF_KIND_CONST:	tag->tag = DW_TAG_const_type;	 break;
-	case BTF_KIND_PTR:	tag->tag = DW_TAG_pointer_type;  break;
-	case BTF_KIND_RESTRICT:	tag->tag = DW_TAG_restrict_type; break;
-	case BTF_KIND_VOLATILE:	tag->tag = DW_TAG_volatile_type; break;
+	case BTF_KIND_CONST:	tag->tag = DW_TAG_const_type;	   break;
+	case BTF_KIND_PTR:	tag->tag = DW_TAG_pointer_type;    break;
+	case BTF_KIND_RESTRICT:	tag->tag = DW_TAG_restrict_type;   break;
+	case BTF_KIND_VOLATILE:	tag->tag = DW_TAG_volatile_type;   break;
+	case BTF_KIND_TYPE_TAG:	tag->tag = DW_TAG_LLVM_annotation; break;
 	default:
 		free(tag);
 		printf("%s: Unknown type %d\n\n", __func__, type);
@@ -399,7 +451,7 @@ static int btf__load_types(struct btf *btf, struct cu *cu)
 	uint32_t type_index;
 	int err;
 
-	for (type_index = 1; type_index <= btf__get_nr_types(btf); type_index++) {
+	for (type_index = 1; type_index < btf__type_cnt(btf); type_index++) {
 		const struct btf_type *type_ptr = btf__type_by_id(btf, type_index);
 		uint32_t type = btf_kind(type_ptr);
 
@@ -419,6 +471,9 @@ static int btf__load_types(struct btf *btf, struct cu *cu)
 		case BTF_KIND_ENUM:
 			err = create_new_enumeration(cu, type_ptr, type_index);
 			break;
+		case BTF_KIND_ENUM64:
+			err = create_new_enumeration64(cu, type_ptr, type_index);
+			break;
 		case BTF_KIND_FWD:
 			err = create_new_forward_decl(cu, type_ptr, type_index);
 			break;
@@ -435,6 +490,12 @@ static int btf__load_types(struct btf *btf, struct cu *cu)
 		case BTF_KIND_PTR:
 		case BTF_KIND_CONST:
 		case BTF_KIND_RESTRICT:
+		/* For type tag it's a bit of a lie.
+		 * In DWARF it is encoded as a child tag of whatever type it
+		 * applies to. Here we load it as a standalone tag with a pointer
+		 * to a next type only to have a valid ID in the types table.
+		 */
+		case BTF_KIND_TYPE_TAG:
 			err = create_new_tag(cu, type, type_ptr, type_index);
 			break;
 		case BTF_KIND_UNKN:
@@ -624,7 +685,7 @@ static int cus__load_btf(struct cus *cus, struct conf_load *conf, const char *fi
 	 * The app stole this cu, possibly deleting it,
 	 * so forget about it
 	 */
-	if (conf && conf->steal && conf->steal(cu, conf))
+	if (conf && conf->steal && conf->steal(cu, conf, NULL))
 		return 0;
 
 	cus__add(cus, cu);

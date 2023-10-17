@@ -8,6 +8,7 @@
 #include <dirent.h>
 #include <dwarf.h>
 #include <elfutils/libdwfl.h>
+#include <elfutils/version.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <fnmatch.h>
@@ -50,6 +51,10 @@
 
 #ifndef DW_OP_addrx
 #define DW_OP_addrx 0xa1
+#endif
+
+#ifndef EM_RISCV
+#define EM_RISCV	243
 #endif
 
 static pthread_mutex_t libdw__lock = PTHREAD_MUTEX_INITIALIZER;
@@ -560,10 +565,11 @@ static struct base_type *base_type__new(Dwarf_Die *die, struct cu *cu, struct co
 		bt->bit_size = attr_numeric(die, DW_AT_byte_size) * 8;
 		uint64_t encoding = attr_numeric(die, DW_AT_encoding);
 		bt->is_bool = encoding == DW_ATE_boolean;
-		bt->is_signed = encoding == DW_ATE_signed;
+		bt->is_signed = (encoding == DW_ATE_signed) || (encoding == DW_ATE_signed_char);
 		bt->is_varargs = false;
 		bt->name_has_encoding = true;
 		bt->float_type = encoding_to_float_type(encoding);
+		INIT_LIST_HEAD(&bt->node);
 	}
 
 	return bt;
@@ -632,6 +638,18 @@ static void type__init(struct type *type, Dwarf_Die *die, struct cu *cu, struct 
 	type->resized		 = 0;
 	type->nr_members	 = 0;
 	type->nr_static_members	 = 0;
+	type->is_signed_enum	 = 0;
+
+	Dwarf_Attribute attr;
+	if (dwarf_attr(die, DW_AT_type, &attr) != NULL) {
+		Dwarf_Die type_die;
+		if (dwarf_formref_die(&attr, &type_die) != NULL) {
+			uint64_t encoding = attr_numeric(&type_die, DW_AT_encoding);
+
+			if (encoding == DW_ATE_signed || encoding == DW_ATE_signed_char)
+				type->is_signed_enum = 1;
+		}
+	}
 }
 
 static struct type *type__new(Dwarf_Die *die, struct cu *cu, struct conf_load *conf)
@@ -734,6 +752,19 @@ static struct variable *variable__new(Dwarf_Die *die, struct cu *cu, struct conf
 	return var;
 }
 
+static struct constant *constant__new(Dwarf_Die *die, struct cu *cu, struct conf_load *conf)
+{
+	struct constant *constant = tag__alloc(cu, sizeof(*constant));
+
+	if (constant != NULL) {
+		tag__init(&constant->tag, cu, die);
+		constant->name = attr_string(die, DW_AT_name, conf);
+		constant->value = attr_numeric(die, DW_AT_const_value);
+	}
+
+	return constant;
+}
+
 static int tag__recode_dwarf_bitfield(struct tag *tag, struct cu *cu, uint16_t bit_size)
 {
 	int id;
@@ -770,7 +801,8 @@ static int tag__recode_dwarf_bitfield(struct tag *tag, struct cu *cu, uint16_t b
 		break;
 
 	case DW_TAG_const_type:
-	case DW_TAG_volatile_type: {
+	case DW_TAG_volatile_type:
+	case DW_TAG_atomic_type: {
 		const struct dwarf_tag *dtag = tag->priv;
 		struct dwarf_tag *dtype = dwarf_cu__find_type_by_ref(cu->priv, &dtag->type);
 
@@ -978,13 +1010,160 @@ static struct class_member *class_member__new(Dwarf_Die *die, struct cu *cu,
 	return member;
 }
 
-static struct parameter *parameter__new(Dwarf_Die *die, struct cu *cu, struct conf_load *conf)
+/* How many function parameters are passed via registers?  Used below in
+ * determining if an argument has been optimized out or if it is simply
+ * an argument > cu__nr_register_params().  Making cu__nr_register_params()
+ * return 0 allows unsupported architectures to skip tagging optimized-out
+ * values.
+ */
+static int arch__nr_register_params(const GElf_Ehdr *ehdr)
+{
+	switch (ehdr->e_machine) {
+	case EM_S390:	 return 5;
+	case EM_SPARC:
+	case EM_SPARCV9:
+	case EM_X86_64:	 return 6;
+	case EM_AARCH64:
+	case EM_ARC:
+	case EM_ARM:
+	case EM_MIPS:
+	case EM_PPC:
+	case EM_PPC64:
+	case EM_RISCV:	 return 8;
+	default:	 break;
+	}
+
+	return 0;
+}
+
+/* map from parameter index (0 for first, ...) to expected DW_OP_reg.
+ * This will allow us to identify cases where optimized-out parameters
+ * interfere with expectations about register contents on function
+ * entry.
+ */
+static void arch__set_register_params(const GElf_Ehdr *ehdr, struct cu *cu)
+{
+	memset(cu->register_params, -1, sizeof(cu->register_params));
+
+	switch (ehdr->e_machine) {
+	case EM_S390:
+		/* https://github.com/IBM/s390x-abi/releases/download/v1.6/lzsabi_s390x.pdf */
+		cu->register_params[0] = DW_OP_reg2;	// %r2
+		cu->register_params[1] = DW_OP_reg3;	// %r3
+		cu->register_params[2] = DW_OP_reg4;	// %r4
+		cu->register_params[3] = DW_OP_reg5;	// %r5
+		cu->register_params[4] = DW_OP_reg6;	// %r6
+		return;
+	case EM_X86_64:
+		/* //en.wikipedia.org/wiki/X86_calling_conventions#System_V_AMD64_ABI */
+		cu->register_params[0] = DW_OP_reg5;	// %rdi
+		cu->register_params[1] = DW_OP_reg4;	// %rsi
+		cu->register_params[2] = DW_OP_reg1;	// %rdx
+		cu->register_params[3] = DW_OP_reg2;	// %rcx
+		cu->register_params[4] = DW_OP_reg8;	// %r8
+		cu->register_params[5] = DW_OP_reg9;	// %r9
+		return;
+	case EM_ARM:
+		/* https://github.com/ARM-software/abi-aa/blob/main/aapcs32/aapcs32.rst#machine-registers */
+	case EM_AARCH64:
+		/* https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst#machine-registers */
+		cu->register_params[0] = DW_OP_reg0;
+		cu->register_params[1] = DW_OP_reg1;
+		cu->register_params[2] = DW_OP_reg2;
+		cu->register_params[3] = DW_OP_reg3;
+		cu->register_params[4] = DW_OP_reg4;
+		cu->register_params[5] = DW_OP_reg5;
+		cu->register_params[6] = DW_OP_reg6;
+		cu->register_params[7] = DW_OP_reg7;
+		return;
+	default:
+		return;
+	}
+}
+
+static struct parameter *parameter__new(Dwarf_Die *die, struct cu *cu,
+					struct conf_load *conf, int param_idx)
 {
 	struct parameter *parm = tag__alloc(cu, sizeof(*parm));
 
 	if (parm != NULL) {
+		Dwarf_Addr base, start, end;
+		bool has_const_value;
+		Dwarf_Attribute attr;
+		struct location loc;
+
 		tag__init(&parm->tag, cu, die);
 		parm->name = attr_string(die, DW_AT_name, conf);
+
+		if (param_idx >= cu->nr_register_params || param_idx < 0)
+			return parm;
+		/* Parameters which use DW_AT_abstract_origin to point at
+		 * the original parameter definition (with no name in the DIE)
+		 * are the result of later DWARF generation during compilation
+		 * so often better take into account if arguments were
+		 * optimized out.
+		 *
+		 * By checking that locations for parameters that are expected
+		 * to be passed as registers are actually passed as registers,
+		 * we can spot optimized-out parameters.
+		 *
+		 * It can also be the case that a parameter DIE has
+		 * a constant value attribute reflecting optimization or
+		 * has no location attribute.
+		 *
+		 * From the DWARF spec:
+		 *
+		 * "4.1.10
+		 *
+		 * A DW_AT_const_value attribute for an entry describing a
+		 * variable or formal parameter whose value is constant and not
+		 * represented by an object in the address space of the program,
+		 * or an entry describing a named constant. (Note
+		 * that such an entry does not have a location attribute.)"
+		 *
+		 * So we can also use the absence of a location for a parameter
+		 * as evidence it has been optimized out.  This info will
+		 * need to be shared between a parameter and any abstract
+		 * origin references however, since gcc can have location
+		 * information in the parameter that refers back to the original
+		 * via abstract origin, so we need to share location presence
+		 * between these parameter representations.  See
+		 * ftype__recode_dwarf_types() below for how this is handled.
+		 */
+		has_const_value = dwarf_attr(die, DW_AT_const_value, &attr) != NULL;
+		parm->has_loc = dwarf_attr(die, DW_AT_location, &attr) != NULL;
+		/* dwarf_getlocations() handles location lists; here we are
+		 * only interested in the first expr.
+		 */
+		if (parm->has_loc &&
+#if _ELFUTILS_PREREQ(0, 157)
+		    dwarf_getlocations(&attr, 0, &base, &start, &end,
+				       &loc.expr, &loc.exprlen) > 0 &&
+#else
+		    dwarf_getlocation(&attr, &loc.expr, &loc.exprlen) == 0 &&
+#endif
+			loc.exprlen != 0) {
+			int expected_reg = cu->register_params[param_idx];
+			Dwarf_Op *expr = loc.expr;
+
+			switch (expr->atom) {
+			case DW_OP_reg0 ... DW_OP_reg31:
+				/* mark parameters that use an unexpected
+				 * register to hold a parameter; these will
+				 * be problematic for users of BTF as they
+				 * violate expectations about register
+				 * contents.
+				 */
+				if (expected_reg >= 0 && expected_reg != expr->atom)
+					parm->unexpected_reg = 1;
+				break;
+			default:
+				parm->optimized = 1;
+				break;
+			}
+		} else if (has_const_value) {
+			parm->optimized = 1;
+		}
 	}
 
 	return parm;
@@ -1107,6 +1286,7 @@ static void ftype__init(struct ftype *ftype, Dwarf_Die *die, struct cu *cu)
 	assert(tag == DW_TAG_subprogram || tag == DW_TAG_subroutine_type);
 #endif
 	tag__init(&ftype->tag, cu, die);
+	ftype->byte_size = attr_numeric(die, DW_AT_byte_size);
 	INIT_LIST_HEAD(&ftype->parms);
 	ftype->nr_parms	    = 0;
 	ftype->unspec_parms = 0;
@@ -1436,7 +1616,7 @@ static struct tag *die__create_new_parameter(Dwarf_Die *die,
 					     struct cu *cu, struct conf_load *conf,
 					     int param_idx)
 {
-	struct parameter *parm = parameter__new(die, cu, conf);
+	struct parameter *parm = parameter__new(die, cu, conf, param_idx);
 
 	if (parm == NULL)
 		return NULL;
@@ -1489,6 +1669,16 @@ static struct tag *die__create_new_variable(Dwarf_Die *die, struct cu *cu, struc
 		return NULL;
 
 	return &var->ip.tag;
+}
+
+static struct tag *die__create_new_constant(Dwarf_Die *die, struct cu *cu, struct conf_load *conf)
+{
+	struct constant *constant = constant__new(die, cu, conf);
+
+	if (constant == NULL)
+		return NULL;
+
+	return &constant->tag;
 }
 
 static struct tag *die__create_new_subroutine_type(Dwarf_Die *die,
@@ -1993,8 +2183,10 @@ static struct tag *__die__process_tag(Dwarf_Die *die, struct cu *cu,
 	case DW_TAG_imported_module:
 	case DW_TAG_reference_type:
 	case DW_TAG_restrict_type:
-	case DW_TAG_unspecified_type:
 	case DW_TAG_volatile_type:
+	case DW_TAG_atomic_type:
+		tag = die__create_new_tag(die, cu);		break;
+	case DW_TAG_unspecified_type:
 		tag = die__create_new_tag(die, cu);		break;
 	case DW_TAG_pointer_type:
 		tag = die__create_new_pointer_tag(die, cu, conf);	break;
@@ -2019,6 +2211,8 @@ static struct tag *__die__process_tag(Dwarf_Die *die, struct cu *cu,
 		tag = die__create_new_union(die, cu, conf);	break;
 	case DW_TAG_variable:
 		tag = die__create_new_variable(die, cu, conf);	break;
+	case DW_TAG_constant: // First seen in a Go CU
+		tag = die__create_new_constant(die, cu, conf);	break;
 	default:
 		__cu__tag_not_handled(die, fn);
 		/* fall thru */
@@ -2058,8 +2252,24 @@ static int die__process_unit(Dwarf_Die *die, struct cu *cu, struct conf_load *co
 			continue;
 		}
 
-		uint32_t id;
-		cu__add_tag(cu, tag, &id);
+		uint32_t id = 0;
+		/* There is no BTF representation for unspecified types.
+		 * Currently we want such types to be represented as `void`
+		 * (and thus skip BTF encoding).
+		 *
+		 * As BTF encoding is skipped, such types must not be added to type table,
+		 * otherwise an ID for a type would be allocated and we would be forced
+		 * to put something in BTF at this ID.
+		 * Thus avoid `cu__add_tag()` call for such types.
+		 *
+		 * On the other hand, there might be references to this type from other
+		 * tags, so `dwarf_cu__find_tag_by_ref()` must return something.
+		 * Thus call `cu__hash()` for such types.
+		 *
+		 * Note, that small_id of zero would be assigned to unspecified type entry.
+		 */
+		if (tag->tag != DW_TAG_unspecified_type)
+			cu__add_tag(cu, tag, &id);
 		cu__hash(cu, tag);
 		struct dwarf_tag *dtag = tag->priv;
 		dtag->small_id = id;
@@ -2175,6 +2385,7 @@ static void ftype__recode_dwarf_types(struct tag *tag, struct cu *cu)
 
 	ftype__for_each_parameter(type, pos) {
 		struct dwarf_tag *dpos = pos->tag.priv;
+		struct parameter *opos;
 		struct dwarf_tag *dtype;
 
 		if (dpos->type.off == 0) {
@@ -2188,8 +2399,22 @@ static void ftype__recode_dwarf_types(struct tag *tag, struct cu *cu)
 				tag__print_abstract_origin_not_found(&pos->tag);
 				continue;
 			}
-			pos->name = tag__parameter(dtype->tag)->name;
+			opos = tag__parameter(dtype->tag);
+			pos->name = opos->name;
 			pos->tag.type = dtype->tag->type;
+			/* share location information between parameter and
+			 * abstract origin; if neither have location, we will
+			 * mark the parameter as optimized out.  Also share
+			 * info regarding unexpected register use for
+			 * parameters.
+			 */
+			if (pos->has_loc)
+				opos->has_loc = pos->has_loc;
+
+			if (pos->optimized)
+				opos->optimized = pos->optimized;
+			if (pos->unexpected_reg)
+				opos->unexpected_reg = pos->unexpected_reg;
 			continue;
 		}
 
@@ -2216,9 +2441,15 @@ static void lexblock__recode_dwarf_types(struct lexblock *tag, struct cu *cu)
 			lexblock__recode_dwarf_types(tag__lexblock(pos), cu);
 			continue;
 		case DW_TAG_inlined_subroutine:
-			dtype = dwarf_cu__find_tag_by_ref(dcu, &dpos->type);
+			if (dpos->type.off != 0)
+				dtype = dwarf_cu__find_tag_by_ref(dcu, &dpos->type);
+			else
+				dtype = dwarf_cu__find_tag_by_ref(dcu, &dpos->abstract_origin);
 			if (dtype == NULL) {
-				tag__print_type_not_found(pos);
+				if (dpos->type.off != 0)
+					tag__print_type_not_found(pos);
+				else
+					tag__print_abstract_origin_not_found(pos);
 				continue;
 			}
 			ftype__recode_dwarf_types(dtype->tag, cu);
@@ -2459,18 +2690,70 @@ out:
 	return 0;
 }
 
-static int cu__resolve_func_ret_types(struct cu *cu)
+static bool param__is_struct(struct cu *cu, struct tag *tag)
+{
+	struct tag *type = cu__type(cu, tag->type);
+
+	if (!type)
+		return false;
+
+	switch (type->tag) {
+	case DW_TAG_structure_type:
+		return true;
+	case DW_TAG_const_type:
+	case DW_TAG_typedef:
+		/* handle "typedef struct", const parameter */
+		return param__is_struct(cu, type);
+	default:
+		return false;
+	}
+}
+
+static int cu__resolve_func_ret_types_optimized(struct cu *cu)
 {
 	struct ptr_table *pt = &cu->functions_table;
 	uint32_t i;
 
 	for (i = 0; i < pt->nr_entries; ++i) {
 		struct tag *tag = pt->entries[i];
+		struct parameter *pos;
+		struct function *fn = tag__function(tag);
+		bool has_unexpected_reg = false, has_struct_param = false;
+
+		/* mark function as optimized if parameter is, or
+		 * if parameter does not have a location; at this
+		 * point location presence has been marked in
+		 * abstract origins for cases where a parameter
+		 * location is not stored in the original function
+		 * parameter tag.
+		 *
+		 * Also mark functions which, due to optimization,
+		 * use an unexpected register for a parameter.
+		 * Exception is functions which have a struct
+		 * as a parameter, as multiple registers may
+		 * be used to represent it, throwing off register
+		 * to parameter mapping.
+		 */
+		ftype__for_each_parameter(&fn->proto, pos) {
+			if (pos->optimized || !pos->has_loc)
+				fn->proto.optimized_parms = 1;
+
+			if (pos->unexpected_reg)
+				has_unexpected_reg = true;
+		}
+		if (has_unexpected_reg) {
+			ftype__for_each_parameter(&fn->proto, pos) {
+				has_struct_param = param__is_struct(cu, &pos->tag);
+				if (has_struct_param)
+					break;
+			}
+			if (!has_struct_param)
+				fn->proto.unexpected_reg = 1;
+		}
 
 		if (tag == NULL || tag->type != 0)
 			continue;
 
-		struct function *fn = tag__function(tag);
 		if (!fn->abstract_origin)
 			continue;
 
@@ -2498,6 +2781,7 @@ static int cu__recode_dwarf_types_table(struct cu *cu,
 			if (tag__recode_dwarf_type(tag, cu))
 				return -1;
 	}
+
 	return 0;
 }
 
@@ -2592,7 +2876,7 @@ static int die__process_and_recode(Dwarf_Die *die, struct cu *cu, struct conf_lo
 	if (ret != 0)
 		return ret;
 
-	return cu__resolve_func_ret_types(cu);
+	return cu__resolve_func_ret_types_optimized(cu);
 }
 
 static int class_member__cache_byte_size(struct tag *tag, struct cu *cu,
@@ -2694,18 +2978,60 @@ static int class_member__cache_byte_size(struct tag *tag, struct cu *cu,
 	return 0;
 }
 
-static int cu__finalize(struct cu *cu, struct conf_load *conf)
+static bool cu__language_reorders_offsets(const struct cu *cu)
+{
+	return cu->language == DW_LANG_Rust;
+}
+
+static int type__sort_by_offset(struct tag *tag, struct cu *cu, void *cookie __maybe_unused)
+{
+	if (!tag__is_type(tag))
+		return 0;
+
+	struct type *type = tag__type(tag);
+	struct class_member *current_member;
+
+	// There may be more than DW_TAG_members entries in the type tags, so do a simple
+	// bubble sort for now, so that the other non tags stay where they are.
+restart:
+	type__for_each_data_member(type, current_member) {
+		if (list_is_last(&current_member->tag.node, &type->namespace.tags))
+		       break;
+
+		struct class_member *next_member = list_entry(current_member->tag.node.next, typeof(*current_member), tag.node);
+
+		if (current_member->byte_offset <= next_member->byte_offset)
+			continue;
+
+		list_del(&current_member->tag.node);
+		list_add(&current_member->tag.node, &next_member->tag.node);
+		goto restart;
+	}
+
+	return 0;
+}
+
+static void cu__sort_types_by_offset(struct cu *cu, struct conf_load *conf)
+{
+	cu__for_all_tags(cu, type__sort_by_offset, conf);
+}
+
+static int cu__finalize(struct cu *cu, struct conf_load *conf, void *thr_data)
 {
 	cu__for_all_tags(cu, class_member__cache_byte_size, conf);
+
+	if (cu__language_reorders_offsets(cu))
+		cu__sort_types_by_offset(cu, conf);
+
 	if (conf && conf->steal) {
-		return conf->steal(cu, conf);
+		return conf->steal(cu, conf, thr_data);
 	}
 	return LSK__KEEPIT;
 }
 
-static int cus__finalize(struct cus *cus, struct cu *cu, struct conf_load *conf)
+static int cus__finalize(struct cus *cus, struct cu *cu, struct conf_load *conf, void *thr_data)
 {
-	int lsk = cu__finalize(cu, conf);
+	int lsk = cu__finalize(cu, conf, thr_data);
 	switch (lsk) {
 	case LSK__DELETE:
 		cu__delete(cu);
@@ -2733,6 +3059,8 @@ static int cu__set_common(struct cu *cu, struct conf_load *conf,
 		return DWARF_CB_ABORT;
 
 	cu->little_endian = ehdr.e_ident[EI_DATA] == ELFDATA2LSB;
+	cu->nr_register_params = arch__nr_register_params(&ehdr);
+	arch__set_register_params(&ehdr, cu);
 	return 0;
 }
 
@@ -2788,8 +3116,8 @@ static int __cus__load_debug_types(struct conf_load *conf, Dwfl_Module *mod, Dwa
 	return 0;
 }
 
-/* Match the define in linux:include/linux/elfnote.h */
-#define LINUX_ELFNOTE_BUILD_LTO		0x101
+/* Match the define in linux:include/linux/elfnote-lto.h */
+#define LINUX_ELFNOTE_LTO_INFO		0x101
 
 static bool cus__merging_cu(Dwarf *dw, Elf *elf)
 {
@@ -2807,7 +3135,7 @@ static bool cus__merging_cu(Dwarf *dw, Elf *elf)
 			size_t name_off, desc_off, offset = 0;
 			GElf_Nhdr hdr;
 			while ((offset = gelf_getnote(data, offset, &hdr, &name_off, &desc_off)) != 0) {
-				if (hdr.n_type != LINUX_ELFNOTE_BUILD_LTO)
+				if (hdr.n_type != LINUX_ELFNOTE_LTO_INFO)
 					continue;
 
 				/* owner is Linux */
@@ -2874,7 +3202,13 @@ struct dwarf_cus {
 	struct dwarf_cu	    *type_dcu;
 };
 
-static int dwarf_cus__create_and_process_cu(struct dwarf_cus *dcus, Dwarf_Die *cu_die, uint8_t pointer_size)
+struct dwarf_thread {
+	struct dwarf_cus	*dcus;
+	void			*data;
+};
+
+static int dwarf_cus__create_and_process_cu(struct dwarf_cus *dcus, Dwarf_Die *cu_die,
+					    uint8_t pointer_size, void *thr_data)
 {
 	/*
 	 * DW_AT_name in DW_TAG_compile_unit can be NULL, first seen in:
@@ -2896,7 +3230,7 @@ static int dwarf_cus__create_and_process_cu(struct dwarf_cus *dcus, Dwarf_Die *c
 	cu->dfops = &dwarf__ops;
 
 	if (die__process_and_recode(cu_die, cu, dcus->conf) != 0 ||
-	    cus__finalize(dcus->cus, cu, dcus->conf) == LSK__STOP_LOADING)
+	    cus__finalize(dcus->cus, cu, dcus->conf, thr_data) == LSK__STOP_LOADING)
 		return DWARF_CB_ABORT;
 
        return DWARF_CB_OK;
@@ -2930,7 +3264,8 @@ out_unlock:
 
 static void *dwarf_cus__process_cu_thread(void *arg)
 {
-	struct dwarf_cus *dcus = arg;
+	struct dwarf_thread *dthr = arg;
+	struct dwarf_cus *dcus = dthr->dcus;
 	uint8_t pointer_size, offset_size;
 	Dwarf_Die die_mem, *cu_die;
 
@@ -2938,11 +3273,13 @@ static void *dwarf_cus__process_cu_thread(void *arg)
 		if (cu_die == NULL)
 			break;
 
-		if (dwarf_cus__create_and_process_cu(dcus, cu_die, pointer_size) == DWARF_CB_ABORT)
+		if (dwarf_cus__create_and_process_cu(dcus, cu_die,
+						     pointer_size, dthr->data) == DWARF_CB_ABORT)
 			goto out_abort;
 	}
 
-	if (dcus->conf->thread_exit && dcus->conf->thread_exit() != 0)
+	if (dcus->conf->thread_exit &&
+	    dcus->conf->thread_exit(dcus->conf, dthr->data) != 0)
 		goto out_abort;
 
 	return (void *)DWARF_CB_OK;
@@ -2953,10 +3290,26 @@ out_abort:
 static int dwarf_cus__threaded_process_cus(struct dwarf_cus *dcus)
 {
 	pthread_t threads[dcus->conf->nr_jobs];
+	struct dwarf_thread dthr[dcus->conf->nr_jobs];
+	void *thread_data[dcus->conf->nr_jobs];
+	int res;
 	int i;
 
+	if (dcus->conf->threads_prepare) {
+		res = dcus->conf->threads_prepare(dcus->conf, dcus->conf->nr_jobs, thread_data);
+		if (res != 0)
+			return res;
+	} else {
+		memset(thread_data, 0, sizeof(void *) * dcus->conf->nr_jobs);
+	}
+
 	for (i = 0; i < dcus->conf->nr_jobs; ++i) {
-		dcus->error = pthread_create(&threads[i], NULL, dwarf_cus__process_cu_thread, dcus);
+		dthr[i].dcus = dcus;
+		dthr[i].data = thread_data[i];
+
+		dcus->error = pthread_create(&threads[i], NULL,
+					     dwarf_cus__process_cu_thread,
+					     &dthr[i]);
 		if (dcus->error)
 			goto out_join;
 	}
@@ -2970,6 +3323,13 @@ out_join:
 
 		if (err == 0 && res != NULL)
 			dcus->error = (long)res;
+	}
+
+	if (dcus->conf->threads_collect) {
+		res = dcus->conf->threads_collect(dcus->conf, dcus->conf->nr_jobs,
+						  thread_data, dcus->error);
+		if (dcus->error == 0)
+			dcus->error = res;
 	}
 
 	return dcus->error;
@@ -2988,7 +3348,8 @@ static int __dwarf_cus__process_cus(struct dwarf_cus *dcus)
 		if (cu_die == NULL)
 			break;
 
-		if (dwarf_cus__create_and_process_cu(dcus, cu_die, pointer_size) == DWARF_CB_ABORT)
+		if (dwarf_cus__create_and_process_cu(dcus, cu_die,
+						     pointer_size, NULL) == DWARF_CB_ABORT)
 			return DWARF_CB_ABORT;
 
 		dcus->off = noff;
@@ -3079,10 +3440,10 @@ static int cus__merge_and_process_cu(struct cus *cus, struct conf_load *conf,
 	 * encoded in another subprogram through abstract_origin
 	 * tag. Let us visit all subprograms again to resolve this.
 	 */
-	if (cu__resolve_func_ret_types(cu) != LSK__KEEPIT)
+	if (cu__resolve_func_ret_types_optimized(cu) != LSK__KEEPIT)
 		goto out_abort;
 
-	if (cus__finalize(cus, cu, conf) == LSK__STOP_LOADING)
+	if (cus__finalize(cus, cu, conf, NULL) == LSK__STOP_LOADING)
 		goto out_abort;
 
 	return 0;
@@ -3114,7 +3475,7 @@ static int cus__load_module(struct cus *cus, struct conf_load *conf,
 	}
 
 	if (type_cu != NULL) {
-		type_lsk = cu__finalize(type_cu, conf);
+		type_lsk = cu__finalize(type_cu, conf, NULL);
 		if (type_lsk == LSK__KEEPIT) {
 			cus__add(cus, type_cu);
 		}
@@ -3247,7 +3608,9 @@ static int cus__process_file(struct cus *cus, struct conf_load *conf, int fd,
 	};
 
 	/* Process the one or more modules gleaned from this file. */
-	dwfl_getmodules(dwfl, cus__process_dwflmod, &parms, 0);
+	int err = dwfl_getmodules(dwfl, cus__process_dwflmod, &parms, 0);
+	if (err < 0)
+		return -1;
 
 	// We can't call dwfl_end(dwfl) here, as we keep pointers to strings
 	// allocated by libdw that will be freed at dwfl_end(), so leave this for

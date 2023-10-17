@@ -37,6 +37,7 @@ cc_library_host_static {
         "dutil.c",
         "dwarf_loader.c",
         "dwarves.c",
+        "dwarves_emit.c",
         "dwarves_fprintf.c",
         "dwarves_reorganize.c",
         "elf_symtab.c",

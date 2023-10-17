@@ -53,7 +53,7 @@ struct fn_stats {
 
 static struct fn_stats *fn_stats__new(struct tag *tag, const struct cu *cu)
 {
-	struct fn_stats *stats = malloc(sizeof(*stats));
+	struct fn_stats *stats = zalloc(sizeof(*stats));
 
 	if (stats != NULL) {
 		const struct function *fn = tag__function(tag);
@@ -489,7 +489,9 @@ int elf_symtabs__show(char *filenames[])
 	return EXIT_SUCCESS;
 }
 
-static enum load_steal_kind pfunct_stealer(struct cu *cu, struct conf_load *conf_load __maybe_unused)
+static enum load_steal_kind pfunct_stealer(struct cu *cu,
+					   struct conf_load *conf_load __maybe_unused,
+					   void *thr_data __maybe_unused)
 {
 
 	if (function_name) {
@@ -656,7 +658,7 @@ static error_t pfunct__options_parser(int key, char *arg,
 	case 'a': addr = strtoull(arg, NULL, 0);
 		  conf_load.get_addr_info = true;	 break;
 	case 'b': expand_types = true;
-		  type_emissions__init(&emissions);	 break;
+		  type_emissions__init(&emissions, &conf);	 break;
 	case 'c': class_name = arg;			 break;
 	case 'f': function_name = arg;			 break;
 	case 'F': conf_load.format_path = arg;		 break;
@@ -687,7 +689,7 @@ static error_t pfunct__options_parser(int key, char *arg,
 	case ARGP_no_parm_names: conf.no_parm_names = 1; break;
 	case ARGP_compile:
 		  expand_types = true;
-		  type_emissions__init(&emissions);
+		  type_emissions__init(&emissions, &conf);
 		  compilable_output = true;
 		  conf.no_semicolon = true;
 		  conf.strip_inline = true;

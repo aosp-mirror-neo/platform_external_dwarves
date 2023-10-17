@@ -48,8 +48,9 @@ struct conf_fprintf;
  */
 struct conf_load {
 	enum load_steal_kind	(*steal)(struct cu *cu,
-					 struct conf_load *conf);
-	int			(*thread_exit)(void);
+					 struct conf_load *conf,
+					 void *thr_data);
+	int			(*thread_exit)(struct conf_load *conf, void *thr_data);
 	void			*cookie;
 	char			*format_path;
 	int			nr_jobs;
@@ -64,12 +65,17 @@ struct conf_load {
 	bool			skip_encoding_btf_decl_tag;
 	bool			skip_missing;
 	bool			skip_encoding_btf_type_tag;
+	bool			skip_encoding_btf_enum64;
+	bool			btf_gen_optimized;
+	bool			skip_encoding_btf_inconsistent_proto;
 	uint8_t			hashtable_bits;
 	uint8_t			max_hashtable_bits;
 	uint16_t		kabi_prefix_len;
 	const char		*kabi_prefix;
 	struct btf		*base_btf;
 	struct conf_fprintf	*conf_fprintf;
+	int			(*threads_prepare)(struct conf_load *conf, int nr_threads, void **thr_data);
+	int			(*threads_collect)(struct conf_load *conf, int nr_threads, void **thr_data, int error);
 };
 
 /** struct conf_fprintf - hints to the __fprintf routines
@@ -87,6 +93,7 @@ struct conf_load {
  * @suppress_force_paddings: This makes sense only if the debugging format has struct alignment information,
  *                           So allow for it to be disabled and disable it automatically for things like BTF,
  *                           that don't have such info.
+ * @skip_emitting_atomic_typedefs: Allow not emitting "typedef _Atomic int atomic_int;" and friends
  */
 struct conf_fprintf {
 	const char *prefix;
@@ -125,6 +132,9 @@ struct conf_fprintf {
 	uint8_t	   classes_as_structs:1;
 	uint8_t	   hex_fmt:1;
 	uint8_t	   strip_inline:1;
+	uint8_t	   skip_emitting_atomic_typedefs:1;
+	uint8_t	   skip_emitting_errors:1;
+	uint8_t    skip_emitting_modifier:1;
 };
 
 struct cus;
@@ -226,7 +236,7 @@ struct debug_fmt_ops {
 	bool		   has_alignment_info;
 };
 
-extern struct debug_fmt_ops *dwarves__active_loader;
+#define ARCH_MAX_REGISTER_PARAMS	8
 
 struct cu {
 	struct list_head node;
@@ -250,6 +260,8 @@ struct cu {
 	uint8_t		 has_addr_info:1;
 	uint8_t		 uses_global_strings:1;
 	uint8_t		 little_endian:1;
+	uint8_t		 nr_register_params;
+	int		 register_params[ARCH_MAX_REGISTER_PARAMS];
 	uint16_t	 language;
 	unsigned long	 nr_inline_expansions;
 	size_t		 size_inline_expansions;
@@ -292,6 +304,8 @@ static inline __pure bool cu__is_c(const struct cu *cu)
 {
 	return cu->language == LANG_C;
 }
+
+int lang__str2int(const char *lang);
 
 /**
  * cu__for_each_cached_symtab_entry - iterate thru the cached symtab entries
@@ -370,6 +384,19 @@ static inline __pure bool cu__is_c(const struct cu *cu)
 	for (id = 0; id < cu->tags_table.nr_entries; ++id) \
 		if (!(pos = cu->tags_table.entries[id]) || \
 		    !tag__is_variable(pos))		\
+			continue;			\
+		else
+
+/**
+ * cu__for_each_constant - iterate thru all the global constant tags
+ * @cu: struct cu instance to iterate
+ * @pos: struct tag iterator
+ * @id: uint32_t tag id
+ */
+#define cu__for_each_constant(cu, id, pos)		\
+	for (id = 0; id < cu->tags_table.nr_entries; ++id) \
+		if (!(pos = cu->tags_table.entries[id]) || \
+		    !tag__is_constant(pos))		\
 			continue;			\
 		else
 
@@ -479,9 +506,19 @@ static inline bool tag__is_variable(const struct tag *tag)
 	return tag->tag == DW_TAG_variable;
 }
 
+static inline bool tag__is_constant(const struct tag *tag)
+{
+	return tag->tag == DW_TAG_constant;
+}
+
 static inline bool tag__is_volatile(const struct tag *tag)
 {
 	return tag->tag == DW_TAG_volatile_type;
+}
+
+static inline bool tag__is_atomic(const struct tag *tag)
+{
+	return tag->tag == DW_TAG_atomic_type;
 }
 
 static inline bool tag__is_restrict(const struct tag *tag)
@@ -493,7 +530,8 @@ static inline int tag__is_modifier(const struct tag *tag)
 {
 	return tag__is_const(tag) ||
 	       tag__is_volatile(tag) ||
-	       tag__is_restrict(tag);
+	       tag__is_restrict(tag) ||
+	       tag__is_atomic(tag);
 }
 
 static inline bool tag__has_namespace(const struct tag *tag)
@@ -536,6 +574,8 @@ static inline int tag__is_tag_type(const struct tag *tag)
 	       tag->tag == DW_TAG_subroutine_type ||
 	       tag->tag == DW_TAG_unspecified_type ||
 	       tag->tag == DW_TAG_volatile_type ||
+	       tag->tag == DW_TAG_atomic_type ||
+	       tag->tag == DW_TAG_unspecified_type ||
 	       tag->tag == DW_TAG_LLVM_annotation;
 }
 
@@ -570,11 +610,11 @@ size_t tag__fprintf(struct tag *tag, const struct cu *cu,
 
 const char *tag__name(const struct tag *tag, const struct cu *cu,
 		      char *bf, size_t len, const struct conf_fprintf *conf);
-void tag__not_found_die(const char *file, int line, const char *func);
+void tag__not_found_die(const char *file, int line, const char *func, int tag, const char *name);
 
-#define tag__assert_search_result(tag) \
-	do { if (!tag) tag__not_found_die(__FILE__,\
-					  __LINE__, __func__); } while (0)
+#define tag__assert_search_result(result, tag, name) \
+	do { if (!result) tag__not_found_die(__FILE__,\
+					  __LINE__, __func__, tag, name); } while (0)
 
 size_t tag__size(const struct tag *tag, const struct cu *cu);
 size_t tag__nr_cachelines(const struct conf_fprintf *conf, const struct tag *tag, const struct cu *cu);
@@ -753,6 +793,27 @@ const char *variable__name(const struct variable *var);
 const char *variable__type_name(const struct variable *var,
 				const struct cu *cu, char *bf, size_t len);
 
+struct constant {
+	struct tag tag;
+	const char *name;
+	uint64_t   value;
+};
+
+static inline struct constant *tag__constant(const struct tag *tag)
+{
+	return (struct constant *)tag;
+}
+
+static inline const char *constant__name(const struct constant *constant)
+{
+	return constant->name;
+}
+
+static inline uint64_t constant__value(const struct constant *constant)
+{
+	return constant->value;
+}
+
 struct lexblock {
 	struct ip_tag	 ip;
 	struct list_head tags;
@@ -786,6 +847,9 @@ size_t lexblock__fprintf(const struct lexblock *lexblock, const struct cu *cu,
 struct parameter {
 	struct tag tag;
 	const char *name;
+	uint8_t optimized:1;
+	uint8_t unexpected_reg:1;
+	uint8_t has_loc:1;
 };
 
 static inline struct parameter *tag__parameter(const struct tag *tag)
@@ -804,8 +868,13 @@ static inline const char *parameter__name(const struct parameter *parm)
 struct ftype {
 	struct tag	 tag;
 	struct list_head parms;
+	size_t		 byte_size; // First seen in DW_TAG_subroutine_type in a Go CU
 	uint16_t	 nr_parms;
-	uint8_t		 unspec_parms; /* just one bit is needed */
+	uint8_t		 unspec_parms:1; /* just one bit is needed */
+	uint8_t		 optimized_parms:1;
+	uint8_t		 unexpected_reg:1;
+	uint8_t		 processed:1;
+	uint8_t		 inconsistent_proto:1;
 };
 
 static inline struct ftype *tag__ftype(const struct tag *tag)
@@ -858,6 +927,7 @@ struct function {
 	struct rb_node	 rb_node;
 	const char	 *name;
 	const char	 *linkage_name;
+	const char	 *alias;	/* name.isra.0 */
 	uint32_t	 cu_total_size_inline_expansions;
 	uint16_t	 cu_total_nr_inline_expansions;
 	uint8_t		 inlined:2;
@@ -916,6 +986,10 @@ size_t function__fprintf_stats(const struct tag *tag_func,
 			       FILE *fp);
 const char *function__prototype(const struct function *func,
 				const struct cu *cu, char *bf, size_t len);
+const char *function__prototype_conf(const struct function *func,
+				     const struct cu *cu,
+				     const struct conf_fprintf *conf,
+				     char *bf, size_t len);
 
 static __pure inline uint64_t function__addr(const struct function *func)
 {
@@ -1012,6 +1086,8 @@ struct tag_cu_node {
  * @nr_tags: number of tags
  * @alignment: DW_AT_alignement, zero if not present, gcc emits since circa 7.3.1
  * @natural_alignment: For inferring __packed__, normally the widest scalar in it, recursively
+ * @suffix_disambiguation: if we have both 'union foo' and 'struct foo' then we must disambiguate,
+ *                         useful to generate a vmlinux.h with all Linux types out of BTF data, for instance.
  * @sizeof_member: Use this to find the size of the record
  * @type_member: Use this to select a member from where to get an id on an enum to find a type
  * 		 to cast for, needs to be used with the upcoming type_enum.
@@ -1035,11 +1111,13 @@ struct type {
 	uint16_t	 member_prefix_len;
 	uint16_t	 max_tag_name_len;
 	uint16_t	 natural_alignment;
-	bool		 packed_attributes_inferred;
-	uint8_t		 declaration; /* only one bit used */
+	uint8_t		 suffix_disambiguation;
+	uint8_t		 packed_attributes_inferred:1;
+	uint8_t		 declaration:1;
 	uint8_t		 definition_emitted:1;
 	uint8_t		 fwd_decl_emitted:1;
 	uint8_t		 resized:1;
+	uint8_t		 is_signed_enum:1;
 };
 
 void __type__init(struct type *type);
@@ -1310,12 +1388,14 @@ enum base_type_float_type {
 struct base_type {
 	struct tag	tag;
 	const char	*name;
+	struct list_head node;
 	uint16_t	bit_size;
 	uint8_t		name_has_encoding:1;
 	uint8_t		is_signed:1;
 	uint8_t		is_bool:1;
 	uint8_t		is_varargs:1;
 	uint8_t		float_type:4;
+	uint8_t		definition_emitted:1;
 };
 
 static inline struct base_type *tag__base_type(const struct tag *tag)
@@ -1333,6 +1413,8 @@ const char *__base_type__name(const struct base_type *bt);
 const char *base_type__name(const struct base_type *btype, char *bf, size_t len);
 
 size_t base_type__name_to_size(struct base_type *btype, struct cu *cu);
+
+bool base_type__language_defined(struct base_type *bt);
 
 struct array_type {
 	struct tag	tag;
@@ -1359,7 +1441,7 @@ static inline struct string_type *tag__string_type(const struct tag *tag)
 struct enumerator {
 	struct tag	 tag;
 	const char	 *name;
-	uint32_t	 value;
+	uint64_t	 value;
 	struct tag_cu	 type_enum; // To cache the type_enum searches
 };
 
@@ -1389,5 +1471,13 @@ extern bool print_numeric_version;
 extern bool no_bitfield_type_recode;
 
 extern const char tabs[];
+
+#ifndef DW_TAG_atomic_type
+#define DW_TAG_atomic_type 0x47
+#endif
+
+#ifndef DW_TAG_skeleton_unit
+#define DW_TAG_skeleton_unit 0x4a
+#endif
 
 #endif /* _DWARVES_H_ */
