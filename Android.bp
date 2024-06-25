@@ -51,6 +51,11 @@ cc_library_host_static {
         "libdw",
         "libelf",
     ],
+    target: {
+        musl: {
+            whole_static_libs: ["libobstack"],
+        },
+    },
 }
 
 cc_binary_host {
