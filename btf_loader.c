@@ -53,6 +53,10 @@ static int cu__load_ftype(struct cu *cu, struct ftype *proto, uint32_t tag, cons
 	proto->tag.tag	= tag;
 	proto->tag.type = tp->type;
 	INIT_LIST_HEAD(&proto->parms);
+	INIT_LIST_HEAD(&proto->template_type_params);
+	INIT_LIST_HEAD(&proto->template_value_params);
+	proto->template_parameter_pack = NULL;
+	proto->formal_parameter_pack = NULL;
 
 	for (i = 0; i < vlen; ++i, param++) {
 		if (param->type == 0)
@@ -73,7 +77,7 @@ static int cu__load_ftype(struct cu *cu, struct ftype *proto, uint32_t tag, cons
 
 	return 0;
 out_free_parameters:
-	ftype__delete(proto);
+	ftype__delete(proto, cu);
 	return -ENOMEM;
 }
 
@@ -120,6 +124,7 @@ static void type__init(struct type *type, uint32_t tag, const char *name, size_t
 	type->size = size;
 	type->namespace.tag.tag = tag;
 	type->namespace.name = name;
+	type->template_parameter_pack = NULL;
 }
 
 static struct type *type__new(uint16_t tag, const char *name, size_t size)
@@ -250,7 +255,7 @@ static int create_new_class(struct cu *cu, const struct btf_type *tp, uint32_t i
 
 	return 0;
 out_free:
-	class__delete(class);
+	class__delete(class, cu);
 	return -ENOMEM;
 }
 
@@ -266,11 +271,11 @@ static int create_new_union(struct cu *cu, const struct btf_type *tp, uint32_t i
 
 	return 0;
 out_free:
-	type__delete(un);
+	type__delete(un, cu);
 	return -ENOMEM;
 }
 
-static struct enumerator *enumerator__new(const char *name, uint32_t value)
+static struct enumerator *enumerator__new(const char *name, uint64_t value)
 {
 	struct enumerator *en = tag__alloc(sizeof(*en));
 
@@ -294,9 +299,15 @@ static int create_new_enumeration(struct cu *cu, const struct btf_type *tp, uint
 	if (enumeration == NULL)
 		return -ENOMEM;
 
+	enumeration->is_signed_enum = !!btf_kflag(tp);
+
 	for (i = 0; i < vlen; i++) {
 		const char *name = cu__btf_str(cu, ep[i].name_off);
-		uint32_t value = ep[i].val;
+		uint64_t value = ep[i].val;
+
+		if (!enumeration->is_signed_enum)
+			value = (uint32_t)ep[i].val;
+
 		struct enumerator *enumerator = enumerator__new(name, value);
 
 		if (enumerator == NULL)
@@ -309,7 +320,7 @@ static int create_new_enumeration(struct cu *cu, const struct btf_type *tp, uint
 
 	return 0;
 out_free:
-	enumeration__delete(enumeration);
+	enumeration__delete(enumeration, cu);
 	return -ENOMEM;
 }
 
@@ -338,6 +349,8 @@ static int create_new_enumeration64(struct cu *cu, const struct btf_type *tp, ui
 	if (enumeration == NULL)
 		return -ENOMEM;
 
+	enumeration->is_signed_enum = !!btf_kflag(tp);
+
 	for (i = 0; i < vlen; i++) {
 		const char *name = cu__btf_str(cu, ep[i].name_off);
 		uint64_t value = btf_enum64_value(&ep[i]);
@@ -353,7 +366,7 @@ static int create_new_enumeration64(struct cu *cu, const struct btf_type *tp, ui
 
 	return 0;
 out_free:
-	enumeration__delete(enumeration);
+	enumeration__delete(enumeration, cu);
 	return -ENOMEM;
 }
 #else
@@ -446,6 +459,34 @@ static int create_new_tag(struct cu *cu, int type, const struct btf_type *tp, ui
 	return 0;
 }
 
+static int process_decl_tag(struct cu *cu, const struct btf_type *tp)
+{
+	struct tag *tag = cu__type(cu, tp->type);
+
+	if (tag == NULL)
+		tag = cu__function(cu, tp->type);
+
+	if (tag == NULL)
+		tag = cu__tag(cu, tp->type);
+
+	if (tag == NULL) {
+		printf("WARNING: BTF_KIND_DECL_TAG for unknown BTF id %d\n", tp->type);
+		return 0;
+	}
+
+	const char *attribute = cu__btf_str(cu, tp->name_off);
+
+	if (tag->attribute != NULL) {
+		char bf[128];
+		printf("WARNING: still unsuported BTF_KIND_DECL_TAG(%s) for %s already with attribute (%s), ignoring\n",
+		       attribute, tag__name(tag, cu, bf, sizeof(bf), NULL), tag->attribute);
+	} else {
+		tag->attribute = attribute;
+	}
+
+	return 0;
+}
+
 static int btf__load_types(struct btf *btf, struct cu *cu)
 {
 	uint32_t type_index;
@@ -513,6 +554,9 @@ static int btf__load_types(struct btf *btf, struct cu *cu)
 			break;
 		case BTF_KIND_FLOAT:
 			err = create_new_float_type(cu, type_ptr, type_index);
+			break;
+		case BTF_KIND_DECL_TAG:
+			err = process_decl_tag(cu, type_ptr);
 			break;
 		default:
 			fprintf(stderr, "BTF: idx: %d, Unknown kind %d\n", type_index, type);

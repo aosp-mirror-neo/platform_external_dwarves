@@ -34,6 +34,21 @@
 #include <pthread.h>
 
 #define BTF_ENCODER_MAX_PROTO	512
+#define BTF_IDS_SECTION		".BTF_ids"
+#define BTF_ID_FUNC_PFX		"__BTF_ID__func__"
+#define BTF_ID_SET8_PFX		"__BTF_ID__set8__"
+#define BTF_SET8_KFUNCS		(1 << 0)
+#define BTF_KFUNC_TYPE_TAG	"bpf_kfunc"
+
+/* Adapted from include/linux/btf_ids.h */
+struct btf_id_set8 {
+        uint32_t cnt;
+        uint32_t flags;
+        struct {
+                uint32_t id;
+                uint32_t flags;
+        } pairs[];
+};
 
 /* state used to do later encoding of saved functions */
 struct btf_encoder_state {
@@ -50,8 +65,6 @@ struct elf_function {
 	struct btf_encoder_state state;
 };
 
-#define MAX_PERCPU_VAR_CNT 4096
-
 struct var_info {
 	uint64_t    addr;
 	const char *name;
@@ -66,10 +79,10 @@ struct btf_encoder {
 	struct btf        *btf;
 	struct cu         *cu;
 	struct gobuffer   percpu_secinfo;
+	const char	  *source_filename;
 	const char	  *filename;
 	struct elf_symtab *symtab;
 	uint32_t	  type_id_off;
-	int		  saved_func_cnt;
 	bool		  has_index_type,
 			  need_index_type,
 			  skip_encoding_vars,
@@ -77,11 +90,15 @@ struct btf_encoder {
 			  verbose,
 			  force,
 			  gen_floats,
-			  is_rel;
+			  skip_encoding_decl_tag,
+			  tag_kfuncs,
+			  is_rel,
+			  gen_distilled_base;
 	uint32_t	  array_index_id;
 	struct {
-		struct var_info vars[MAX_PERCPU_VAR_CNT];
+		struct var_info *vars;
 		int		var_cnt;
+		int		allocated;
 		uint32_t	shndx;
 		uint64_t	base_addr;
 		uint64_t	sec_sz;
@@ -92,6 +109,17 @@ struct btf_encoder {
 		int		    cnt;
 		int		    suffix_cnt; /* number of .isra, .part etc */
 	} functions;
+};
+
+struct btf_func {
+	const char *name;
+	int	    type_id;
+};
+
+/* Half open interval representing range of addresses containing kfuncs */
+struct btf_kfunc_set_range {
+	uint64_t start;
+	uint64_t end;
 };
 
 static LIST_HEAD(encoders);
@@ -209,9 +237,9 @@ static const char * btf__int_encoding_str(uint8_t encoding)
 		return "UNKN";
 }
 
-__attribute ((format (printf, 5, 6)))
+__attribute ((format (printf, 6, 7)))
 static void btf__log_err(const struct btf *btf, int kind, const char *name,
-			 bool output_cr, const char *fmt, ...)
+			 bool output_cr, int libbpf_err, const char *fmt, ...)
 {
 	fprintf(stderr, "[%u] %s %s", btf__type_cnt(btf),
 		btf_kind_str[kind], name ?: "(anon)");
@@ -224,6 +252,9 @@ static void btf__log_err(const struct btf *btf, int kind, const char *name,
 		vfprintf(stderr, fmt, ap);
 		va_end(ap);
 	}
+
+	if (libbpf_err < 0)
+		fprintf(stderr, " (libbpf error %d)", libbpf_err);
 
 	if (output_cr)
 		fprintf(stderr, "\n");
@@ -327,7 +358,8 @@ static int32_t btf_encoder__add_float(struct btf_encoder *encoder, const struct 
 	int32_t id = btf__add_float(encoder->btf, name, BITS_ROUNDUP_BYTES(bt->bit_size));
 
 	if (id < 0) {
-		btf__log_err(encoder->btf, BTF_KIND_FLOAT, name, true, "Error emitting BTF type");
+		btf__log_err(encoder->btf, BTF_KIND_FLOAT, name, true, id,
+			     "Error emitting BTF type");
 	} else {
 		const struct btf_type *t;
 
@@ -401,7 +433,7 @@ static int32_t btf_encoder__add_base_type(struct btf_encoder *encoder, const str
 
 	id = btf__add_int(encoder->btf, name, byte_sz, encoding);
 	if (id < 0) {
-		btf__log_err(encoder->btf, BTF_KIND_INT, name, true, "Error emitting BTF type");
+		btf__log_err(encoder->btf, BTF_KIND_INT, name, true, id, "Error emitting BTF type");
 	} else {
 		t = btf__type_by_id(encoder->btf, id);
 		btf_encoder__log_type(encoder, t, false, true, "size=%u nr_bits=%u encoding=%s%s",
@@ -445,7 +477,7 @@ static int32_t btf_encoder__add_ref_type(struct btf_encoder *encoder, uint16_t k
 		id = btf__add_func(btf, name, BTF_FUNC_STATIC, type);
 		break;
 	default:
-		btf__log_err(btf, kind, name, true, "Unexpected kind for reference");
+		btf__log_err(btf, kind, name, true, 0, "Unexpected kind for reference");
 		return -1;
 	}
 
@@ -456,7 +488,7 @@ static int32_t btf_encoder__add_ref_type(struct btf_encoder *encoder, uint16_t k
 		else
 			btf_encoder__log_type(encoder, t, false, true, "type_id=%u", t->type);
 	} else {
-		btf__log_err(btf, kind, name, true, "Error emitting BTF type");
+		btf__log_err(btf, kind, name, true, id, "Error emitting BTF type");
 	}
 	return id;
 }
@@ -475,7 +507,7 @@ static int32_t btf_encoder__add_array(struct btf_encoder *encoder, uint32_t type
 		btf_encoder__log_type(encoder, t, false, true, "type_id=%u index_type_id=%u nr_elems=%u",
 				      array->type, array->index_type, array->nelems);
 	} else {
-		btf__log_err(btf, BTF_KIND_ARRAY, NULL, true,
+		btf__log_err(btf, BTF_KIND_ARRAY, NULL, true, id,
 			      "type_id=%u index_type_id=%u nr_elems=%u Error emitting BTF type",
 			      type, index_type, nelems);
 	}
@@ -517,12 +549,12 @@ static int32_t btf_encoder__add_struct(struct btf_encoder *encoder, uint8_t kind
 		id = btf__add_union(btf, name, size);
 		break;
 	default:
-		btf__log_err(btf, kind, name, true, "Unexpected kind of struct");
+		btf__log_err(btf, kind, name, true, 0, "Unexpected kind of struct");
 		return -1;
 	}
 
 	if (id < 0) {
-		btf__log_err(btf, kind, name, true, "Error emitting BTF type");
+		btf__log_err(btf, kind, name, true, id, "Error emitting BTF type");
 	} else {
 		t = btf__type_by_id(btf, id);
 		btf_encoder__log_type(encoder, t, false, true, "size=%u", t->size);
@@ -572,7 +604,7 @@ static int32_t btf_encoder__add_enum(struct btf_encoder *encoder, const char *na
 		t = btf__type_by_id(btf, id);
 		btf_encoder__log_type(encoder, t, false, true, "size=%u", t->size);
 	} else {
-		btf__log_err(btf, is_enum32 ? BTF_KIND_ENUM : BTF_KIND_ENUM64, name, true,
+		btf__log_err(btf, is_enum32 ? BTF_KIND_ENUM : BTF_KIND_ENUM64, name, true, id,
 			      "size=%u Error emitting BTF type", size);
 	}
 	return id;
@@ -654,9 +686,9 @@ static int32_t btf_encoder__add_func_proto(struct btf_encoder *encoder, struct f
 		t = btf__type_by_id(btf, id);
 		btf_encoder__log_type(encoder, t, false, false, "return=%u args=(%s", t->type, !nr_params ? "void)\n" : "");
 	} else {
-		btf__log_err(btf, BTF_KIND_FUNC_PROTO, NULL, true,
-			      "return=%u vlen=%u Error emitting BTF type",
-			      type_id, nr_params);
+		btf__log_err(btf, BTF_KIND_FUNC_PROTO, NULL, true, id,
+			     "return=%u vlen=%u Error emitting BTF type",
+			     type_id, nr_params);
 		return id;
 	}
 
@@ -690,9 +722,9 @@ static int32_t btf_encoder__add_var(struct btf_encoder *encoder, uint32_t type, 
 		t = btf__type_by_id(btf, id);
 		btf_encoder__log_type(encoder, t, false, true, "type=%u linkage=%u", t->type, btf_var(t)->linkage);
 	} else {
-		btf__log_err(btf, BTF_KIND_VAR, name, true,
-			      "type=%u linkage=%u Error emitting BTF type",
-			      type, linkage);
+		btf__log_err(btf, BTF_KIND_VAR, name, true, id,
+			     "type=%u linkage=%u Error emitting BTF type",
+			     type, linkage);
 	}
 	return id;
 }
@@ -753,9 +785,9 @@ static int32_t btf_encoder__add_datasec(struct btf_encoder *encoder, const char 
 
 	id = btf__add_datasec(btf, section_name, datasec_sz);
 	if (id < 0) {
-		btf__log_err(btf, BTF_KIND_DATASEC, section_name, true,
-				 "size=%u vlen=%u Error emitting BTF type",
-				 datasec_sz, nr_var_secinfo);
+		btf__log_err(btf, BTF_KIND_DATASEC, section_name, true, id,
+			     "size=%u vlen=%u Error emitting BTF type",
+			     datasec_sz, nr_var_secinfo);
 	} else {
 		t = btf__type_by_id(btf, id);
 		btf_encoder__log_type(encoder, t, false, true, "size=%u vlen=%u", t->size, nr_var_secinfo);
@@ -791,7 +823,8 @@ static int32_t btf_encoder__add_decl_tag(struct btf_encoder *encoder, const char
 		btf_encoder__log_type(encoder, t, false, true, "type_id=%u component_idx=%d",
 				      t->type, component_idx);
 	} else {
-		btf__log_err(btf, BTF_KIND_DECL_TAG, value, true, "component_idx=%d Error emitting BTF type",
+		btf__log_err(btf, BTF_KIND_DECL_TAG, value, true, id,
+			     "component_idx=%d Error emitting BTF type",
 			     component_idx);
 	}
 
@@ -874,7 +907,7 @@ static int32_t btf_encoder__save_func(struct btf_encoder *encoder, struct functi
 	} else {
 		func->state.type_id_off = encoder->type_id_off;
 		func->function = fn;
-		encoder->saved_func_cnt++;
+		encoder->cu->functions_saved++;
 	}
 	return 0;
 }
@@ -983,6 +1016,16 @@ static int functions_cmp(const void *_a, const void *_b)
 #define max(x, y) ((x) < (y) ? (y) : (x))
 #endif
 
+static void *reallocarray_grow(void *ptr, int *nmemb, size_t size)
+{
+	int new_nmemb = max(1000, *nmemb * 3 / 2);
+	void *new = realloc(ptr, new_nmemb * size);
+
+	if (new)
+		*nmemb = new_nmemb;
+	return new;
+}
+
 static int btf_encoder__collect_function(struct btf_encoder *encoder, GElf_Sym *sym)
 {
 	struct elf_function *new;
@@ -995,8 +1038,9 @@ static int btf_encoder__collect_function(struct btf_encoder *encoder, GElf_Sym *
 		return 0;
 
 	if (encoder->functions.cnt == encoder->functions.allocated) {
-		encoder->functions.allocated = max(1000, encoder->functions.allocated * 3 / 2);
-		new = realloc(encoder->functions.entries, encoder->functions.allocated * sizeof(*encoder->functions.entries));
+		new = reallocarray_grow(encoder->functions.entries,
+					&encoder->functions.allocated,
+					sizeof(*encoder->functions.entries));
 		if (!new) {
 			/*
 			 * The cleanup - delete_functions is called
@@ -1245,9 +1289,9 @@ static int btf_encoder__write_raw_file(struct btf_encoder *encoder)
 	return err;
 }
 
-static int btf_encoder__write_elf(struct btf_encoder *encoder)
+static int btf_encoder__write_elf(struct btf_encoder *encoder, const struct btf *btf,
+				  const char *btf_secname)
 {
-	struct btf *btf = encoder->btf;
 	const char *filename = encoder->filename;
 	GElf_Shdr shdr_mem, *shdr;
 	Elf_Data *btf_data = NULL;
@@ -1287,7 +1331,7 @@ static int btf_encoder__write_elf(struct btf_encoder *encoder)
 		if (shdr == NULL)
 			continue;
 		char *secname = elf_strptr(elf, strndx, shdr->sh_name);
-		if (strcmp(secname, ".BTF") == 0) {
+		if (strcmp(secname, btf_secname) == 0) {
 			btf_data = elf_getdata(scn, btf_data);
 			break;
 		}
@@ -1331,11 +1375,11 @@ static int btf_encoder__write_elf(struct btf_encoder *encoder)
 			goto unlink;
 		}
 
-		snprintf(cmd, sizeof(cmd), "%s --add-section .BTF=%s %s",
-			 llvm_objcopy, tmp_fn, filename);
+		snprintf(cmd, sizeof(cmd), "%s --add-section %s=%s %s",
+			 llvm_objcopy, btf_secname, tmp_fn, filename);
 		if (system(cmd)) {
-			fprintf(stderr, "%s: failed to add .BTF section to '%s': %d!\n",
-				__func__, filename, errno);
+			fprintf(stderr, "%s: failed to add %s section to '%s': %d!\n",
+				__func__, btf_secname, filename, errno);
 			goto unlink;
 		}
 
@@ -1352,8 +1396,345 @@ out:
 	return err;
 }
 
+/* Returns if `sym` points to a kfunc set */
+static int is_sym_kfunc_set(GElf_Sym *sym, const char *name, Elf_Data *idlist, size_t idlist_addr)
+{
+	void *ptr = idlist->d_buf;
+	struct btf_id_set8 *set;
+	int off;
+
+	/* kfuncs are only found in BTF_SET8's */
+	if (!strstarts(name, BTF_ID_SET8_PFX))
+		return false;
+
+	off = sym->st_value - idlist_addr;
+	if (off >= idlist->d_size) {
+		fprintf(stderr, "%s: symbol '%s' out of bounds\n", __func__, name);
+		return false;
+	}
+
+	/* Check the set8 flags to see if it was marked as kfunc */
+	set = ptr + off;
+	return set->flags & BTF_SET8_KFUNCS;
+}
+
+/*
+ * Parse BTF_ID symbol and return the func name.
+ *
+ * Returns:
+ *	Caller-owned string containing func name if successful.
+ *	NULL if !func or on error.
+ */
+static char *get_func_name(const char *sym)
+{
+	char *func, *end;
+
+	/* Example input: __BTF_ID__func__vfs_close__1
+	 *
+	 * The goal is to strip the prefix and suffix such that we only
+	 * return vfs_close.
+	 */
+
+	if (!strstarts(sym, BTF_ID_FUNC_PFX))
+		return NULL;
+
+	/* Strip prefix and handle malformed input such as  __BTF_ID__func___ */
+	const char *func_sans_prefix = sym + sizeof(BTF_ID_FUNC_PFX) - 1;
+	if (!strstr(func_sans_prefix, "__"))
+                return NULL;
+
+	func = strdup(func_sans_prefix);
+	if (!func)
+		return NULL;
+
+	/* Strip suffix */
+	end = strrchr(func, '_');
+	if (!end || *(end - 1) != '_') {
+		free(func);
+		return NULL;
+	}
+	*(end - 1) = '\0';
+
+	return func;
+}
+
+static int btf_func_cmp(const void *_a, const void *_b)
+{
+	const struct btf_func *a = _a;
+	const struct btf_func *b = _b;
+
+	return strcmp(a->name, b->name);
+}
+
+/*
+ * Collects all functions described in BTF.
+ * Returns non-zero on error.
+ */
+static int btf_encoder__collect_btf_funcs(struct btf_encoder *encoder, struct gobuffer *funcs)
+{
+	struct btf *btf = encoder->btf;
+	int nr_types, type_id;
+	int err = -1;
+
+	/* First collect all the func entries into an array */
+	nr_types = btf__type_cnt(btf);
+	for (type_id = 1; type_id < nr_types; type_id++) {
+		const struct btf_type *type;
+		struct btf_func func = {};
+		const char *name;
+
+		type = btf__type_by_id(btf, type_id);
+		if (!type) {
+			fprintf(stderr, "%s: malformed BTF, can't resolve type for ID %d\n",
+				__func__, type_id);
+			err = -EINVAL;
+			goto out;
+		}
+
+		if (!btf_is_func(type))
+			continue;
+
+		name = btf__name_by_offset(btf, type->name_off);
+		if (!name) {
+			fprintf(stderr, "%s: malformed BTF, can't resolve name for ID %d\n",
+				__func__, type_id);
+			err = -EINVAL;
+			goto out;
+		}
+
+		func.name = name;
+		func.type_id = type_id;
+		err = gobuffer__add(funcs, &func, sizeof(func));
+		if (err < 0)
+			goto out;
+	}
+
+	/* Now that we've collected funcs, sort them by name */
+	gobuffer__sort(funcs, sizeof(struct btf_func), btf_func_cmp);
+
+	err = 0;
+out:
+	return err;
+}
+
+static int btf_encoder__tag_kfunc(struct btf_encoder *encoder, struct gobuffer *funcs, const char *kfunc)
+{
+	struct btf_func key = { .name = kfunc };
+	struct btf *btf = encoder->btf;
+	struct btf_func *target;
+	const void *base;
+	unsigned int cnt;
+	int err = -1;
+
+	base = gobuffer__entries(funcs);
+	cnt = gobuffer__nr_entries(funcs);
+	target = bsearch(&key, base, cnt, sizeof(key), btf_func_cmp);
+	if (!target) {
+		fprintf(stderr, "%s: failed to find kfunc '%s' in BTF\n", __func__, kfunc);
+		goto out;
+	}
+
+	/* Note we are unconditionally adding the btf_decl_tag even
+	 * though vmlinux may already contain btf_decl_tags for kfuncs.
+	 * We are ok to do this b/c we will later btf__dedup() to remove
+	 * any duplicates.
+	 */
+	err = btf__add_decl_tag(btf, BTF_KFUNC_TYPE_TAG, target->type_id, -1);
+	if (err < 0) {
+		fprintf(stderr, "%s: failed to insert kfunc decl tag for '%s': %d\n",
+			__func__, kfunc, err);
+		goto out;
+	}
+
+	err = 0;
+out:
+	return err;
+}
+
+static int btf_encoder__tag_kfuncs(struct btf_encoder *encoder)
+{
+	const char *filename = encoder->source_filename;
+	struct gobuffer btf_kfunc_ranges = {};
+	struct gobuffer btf_funcs = {};
+	Elf_Data *symbols = NULL;
+	Elf_Data *idlist = NULL;
+	Elf_Scn *symscn = NULL;
+	int symbols_shndx = -1;
+	size_t idlist_addr = 0;
+	int fd = -1, err = -1;
+	int idlist_shndx = -1;
+	size_t strtabidx = 0;
+	Elf_Scn *scn = NULL;
+	Elf *elf = NULL;
+	GElf_Shdr shdr;
+	size_t strndx;
+	char *secname;
+	int nr_syms;
+	int i = 0;
+
+	fd = open(filename, O_RDONLY);
+	if (fd < 0) {
+		fprintf(stderr, "Cannot open %s\n", filename);
+		goto out;
+	}
+
+	if (elf_version(EV_CURRENT) == EV_NONE) {
+		elf_error("Cannot set libelf version");
+		goto out;
+	}
+
+	elf = elf_begin(fd, ELF_C_READ, NULL);
+	if (elf == NULL) {
+		elf_error("Cannot update ELF file");
+		goto out;
+	}
+
+	/* Locate symbol table and .BTF_ids sections */
+	if (elf_getshdrstrndx(elf, &strndx) < 0)
+		goto out;
+
+	while ((scn = elf_nextscn(elf, scn)) != NULL) {
+		Elf_Data *data;
+
+		i++;
+		if (!gelf_getshdr(scn, &shdr)) {
+			elf_error("Failed to get ELF section(%d) hdr", i);
+			goto out;
+		}
+
+		secname = elf_strptr(elf, strndx, shdr.sh_name);
+		if (!secname) {
+			elf_error("Failed to get ELF section(%d) hdr name", i);
+			goto out;
+		}
+
+		data = elf_getdata(scn, 0);
+		if (!data) {
+			elf_error("Failed to get ELF section(%d) data", i);
+			goto out;
+		}
+
+		if (shdr.sh_type == SHT_SYMTAB) {
+			symbols_shndx = i;
+			symscn = scn;
+			symbols = data;
+			strtabidx = shdr.sh_link;
+		} else if (!strcmp(secname, BTF_IDS_SECTION)) {
+			idlist_shndx = i;
+			idlist_addr = shdr.sh_addr;
+			idlist = data;
+		}
+	}
+
+	/* Cannot resolve symbol or .BTF_ids sections. Nothing to do. */
+	if (symbols_shndx == -1 || idlist_shndx == -1) {
+		err = 0;
+		goto out;
+	}
+
+	if (!gelf_getshdr(symscn, &shdr)) {
+		elf_error("Failed to get ELF symbol table header");
+		goto out;
+	}
+	nr_syms = shdr.sh_size / shdr.sh_entsize;
+
+	err = btf_encoder__collect_btf_funcs(encoder, &btf_funcs);
+	if (err) {
+		fprintf(stderr, "%s: failed to collect BTF funcs\n", __func__);
+		goto out;
+	}
+
+	/* First collect all kfunc set ranges.
+	 *
+	 * Note we choose not to sort these ranges and accept a linear
+	 * search when doing lookups. Reasoning is that the number of
+	 * sets is ~O(100) and not worth the additional code to optimize.
+	 */
+	for (i = 0; i < nr_syms; i++) {
+		struct btf_kfunc_set_range range = {};
+		const char *name;
+		GElf_Sym sym;
+
+		if (!gelf_getsym(symbols, i, &sym)) {
+			elf_error("Failed to get ELF symbol(%d)", i);
+			goto out;
+		}
+
+		if (sym.st_shndx != idlist_shndx)
+			continue;
+
+		name = elf_strptr(elf, strtabidx, sym.st_name);
+		if (!is_sym_kfunc_set(&sym, name, idlist, idlist_addr))
+			continue;
+
+		range.start = sym.st_value;
+		range.end = sym.st_value + sym.st_size;
+		gobuffer__add(&btf_kfunc_ranges, &range, sizeof(range));
+	}
+
+	/* Now inject BTF with kfunc decl tag for detected kfuncs */
+	for (i = 0; i < nr_syms; i++) {
+		const struct btf_kfunc_set_range *ranges;
+		unsigned int ranges_cnt;
+		char *func, *name;
+		GElf_Sym sym;
+		bool found;
+		int err;
+		int j;
+
+		if (!gelf_getsym(symbols, i, &sym)) {
+			elf_error("Failed to get ELF symbol(%d)", i);
+			goto out;
+		}
+
+		if (sym.st_shndx != idlist_shndx)
+			continue;
+
+		name = elf_strptr(elf, strtabidx, sym.st_name);
+		func = get_func_name(name);
+		if (!func)
+			continue;
+
+		/* Check if function belongs to a kfunc set */
+		ranges = gobuffer__entries(&btf_kfunc_ranges);
+		ranges_cnt = gobuffer__nr_entries(&btf_kfunc_ranges);
+		found = false;
+		for (j = 0; j < ranges_cnt; j++) {
+			size_t addr = sym.st_value;
+
+			if (ranges[j].start <= addr && addr < ranges[j].end) {
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			free(func);
+			continue;
+		}
+
+		err = btf_encoder__tag_kfunc(encoder, &btf_funcs, func);
+		if (err) {
+			fprintf(stderr, "%s: failed to tag kfunc '%s'\n", __func__, func);
+			free(func);
+			goto out;
+		}
+		free(func);
+	}
+
+	err = 0;
+out:
+	__gobuffer__delete(&btf_funcs);
+	__gobuffer__delete(&btf_kfunc_ranges);
+	if (elf)
+		elf_end(elf);
+	if (fd != -1)
+		close(fd);
+	return err;
+}
+
 int btf_encoder__encode(struct btf_encoder *encoder)
 {
+	bool should_tag_kfuncs;
 	int err;
 
 	/* for single-threaded case, saved funcs are added here */
@@ -1366,16 +1747,47 @@ int btf_encoder__encode(struct btf_encoder *encoder)
 	if (btf__type_cnt(encoder->btf) == 1)
 		return 0;
 
+	/* Note vmlinux may already contain btf_decl_tag's for kfuncs. So
+	 * take care to call this before btf_dedup().
+	 */
+	should_tag_kfuncs = encoder->tag_kfuncs && !encoder->skip_encoding_decl_tag;
+	if (should_tag_kfuncs && btf_encoder__tag_kfuncs(encoder)) {
+		fprintf(stderr, "%s: failed to tag kfuncs!\n", __func__);
+		return -1;
+	}
+
 	if (btf__dedup(encoder->btf, NULL)) {
 		fprintf(stderr, "%s: btf__dedup failed!\n", __func__);
 		return -1;
 	}
-
-	if (encoder->raw_output)
+	if (encoder->raw_output) {
 		err = btf_encoder__write_raw_file(encoder);
-	else
-		err = btf_encoder__write_elf(encoder);
+	} else {
+		/* non-embedded libbpf may not have btf__distill_base() or a
+		 * definition of BTF_BASE_ELF_SEC, so conditionally compile
+		 * distillation code.  Like other --btf_features, it will
+		 * silently ignore the feature request if libbpf does not
+		 * support it.
+		 */
+#if LIBBPF_MAJOR_VERSION >= 1 && LIBBPF_MINOR_VERSION >= 5
+		if (encoder->gen_distilled_base) {
+			struct btf *btf = NULL, *distilled_base = NULL;
 
+			if (btf__distill_base(encoder->btf, &distilled_base, &btf) < 0) {
+				fprintf(stderr, "could not generate distilled base BTF: %s\n",
+					strerror(errno));
+				return -1;
+			}
+			err = btf_encoder__write_elf(encoder, btf, BTF_ELF_SEC);
+			if (!err)
+				err = btf_encoder__write_elf(encoder, distilled_base, BTF_BASE_ELF_SEC);
+			btf__free(btf);
+			btf__free(distilled_base);
+			return err;
+		}
+#endif
+		err = btf_encoder__write_elf(encoder, encoder->btf, BTF_ELF_SEC);
+	}
 	return err;
 }
 
@@ -1439,10 +1851,17 @@ static int btf_encoder__collect_percpu_var(struct btf_encoder *encoder, GElf_Sym
 	if (!encoder->is_rel)
 		addr -= encoder->percpu.base_addr;
 
-	if (encoder->percpu.var_cnt == MAX_PERCPU_VAR_CNT) {
-		fprintf(stderr, "Reached the limit of per-CPU variables: %d\n",
-			MAX_PERCPU_VAR_CNT);
-		return -1;
+	if (encoder->percpu.var_cnt == encoder->percpu.allocated) {
+		struct var_info *new;
+
+		new = reallocarray_grow(encoder->percpu.vars,
+					&encoder->percpu.allocated,
+					sizeof(*encoder->percpu.vars));
+		if (!new) {
+			fprintf(stderr, "Failed to allocate memory for variables\n");
+			return -1;
+		}
+		encoder->percpu.vars = new;
 	}
 	encoder->percpu.vars[encoder->percpu.var_cnt].addr = addr;
 	encoder->percpu.vars[encoder->percpu.var_cnt].sz = size;
@@ -1625,23 +2044,27 @@ out:
 	return err;
 }
 
-struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filename, struct btf *base_btf, bool skip_encoding_vars, bool force, bool gen_floats, bool verbose)
+struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filename, struct btf *base_btf, bool verbose, struct conf_load *conf_load)
 {
 	struct btf_encoder *encoder = zalloc(sizeof(*encoder));
 
 	if (encoder) {
 		encoder->raw_output = detached_filename != NULL;
+		encoder->source_filename = strdup(cu->filename);
 		encoder->filename = strdup(encoder->raw_output ? detached_filename : cu->filename);
-		if (encoder->filename == NULL)
+		if (encoder->source_filename == NULL || encoder->filename == NULL)
 			goto out_delete;
 
 		encoder->btf = btf__new_empty_split(base_btf);
 		if (encoder->btf == NULL)
 			goto out_delete;
 
-		encoder->force		 = force;
-		encoder->gen_floats	 = gen_floats;
-		encoder->skip_encoding_vars = skip_encoding_vars;
+		encoder->force		 = conf_load->btf_encode_force;
+		encoder->gen_floats	 = conf_load->btf_gen_floats;
+		encoder->skip_encoding_vars = conf_load->skip_encoding_btf_vars;
+		encoder->skip_encoding_decl_tag	 = conf_load->skip_encoding_btf_decl_tag;
+		encoder->tag_kfuncs	 = conf_load->btf_decl_tag_kfuncs;
+		encoder->gen_distilled_base = conf_load->btf_gen_distilled_base;
 		encoder->verbose	 = verbose;
 		encoder->has_index_type  = false;
 		encoder->need_index_type = false;
@@ -1713,6 +2136,7 @@ void btf_encoder__delete(struct btf_encoder *encoder)
 	btf_encoders__delete(encoder);
 	__gobuffer__delete(&encoder->percpu_secinfo);
 	zfree(&encoder->filename);
+	zfree(&encoder->source_filename);
 	btf__free(encoder->btf);
 	encoder->btf = NULL;
 	elf_symtab__delete(encoder->symtab);
@@ -1720,6 +2144,9 @@ void btf_encoder__delete(struct btf_encoder *encoder)
 	encoder->functions.allocated = encoder->functions.cnt = 0;
 	free(encoder->functions.entries);
 	encoder->functions.entries = NULL;
+	encoder->percpu.allocated = encoder->percpu.var_cnt = 0;
+	free(encoder->percpu.vars);
+	encoder->percpu.vars = NULL;
 
 	free(encoder);
 }
@@ -1879,7 +2306,7 @@ int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct co
 	 * functions for later addition.
 	 */
 	if (!err)
-		err = encoder->saved_func_cnt > 0 ? LSK__KEEPIT : LSK__DELETE;
+		err = encoder->cu->functions_saved > 0 ? LSK__KEEPIT : LSK__DELETE;
 out:
 	encoder->cu = NULL;
 	return err;

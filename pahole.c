@@ -31,14 +31,13 @@
 
 static struct btf_encoder *btf_encoder;
 static char *detached_btf_filename;
+struct cus *cus;
 static bool btf_encode;
-static bool btf_gen_floats;
 static bool ctf_encode;
 static bool sort_output;
 static bool need_resort;
 static bool first_obj_only;
-static bool skip_encoding_btf_vars;
-static bool btf_encode_force;
+static bool show_running_kernel_vmlinux;
 static const char *base_btf_file;
 
 static const char *prettify_input_filename;
@@ -69,6 +68,7 @@ static uint8_t global_verbose;
 static uint8_t recursive;
 static size_t cacheline_size;
 static uint8_t find_containers;
+static bool find_enumeration_with_enumerator;
 static uint8_t find_pointers_in_structs;
 static int reorganize;
 static bool show_private_classes;
@@ -78,6 +78,7 @@ static bool just_structs;
 static bool just_packed_structs;
 static int show_reorg_steps;
 static const char *class_name;
+static const char *enumerator_name;
 static LIST_HEAD(class_names);
 static char separator = '\t';
 
@@ -707,7 +708,7 @@ static int class__packable(struct class *class, struct cu *cu)
 	if (class->nr_holes == 0 && class->nr_bit_holes == 0)
 		return 0;
 
-	clone = class__clone(class, NULL);
+	clone = class__clone(class, NULL, cu);
 	if (clone == NULL)
 		return 0;
 	class__reorganize(clone, cu, 0, stdout);
@@ -715,7 +716,7 @@ static int class__packable(struct class *class, struct cu *cu)
 		class->priv = clone;
 		return 1;
 	}
-	class__delete(clone);
+	class__delete(clone, cu);
 	return 0;
 }
 
@@ -1232,6 +1233,176 @@ ARGP_PROGRAM_VERSION_HOOK_DEF = dwarves_print_version;
 #define ARGP_skip_emitting_atomic_typedefs 338
 #define ARGP_btf_gen_optimized  339
 #define ARGP_skip_encoding_btf_inconsistent_proto 340
+#define ARGP_btf_features	341
+#define ARGP_supported_btf_features 342
+#define ARGP_btf_features_strict 343
+#define ARGP_contains_enumerator 344
+#define ARGP_reproducible_build 345
+#define ARGP_running_kernel_vmlinux 346
+
+/* --btf_features=feature1[,feature2,..] allows us to specify
+ * a list of requested BTF features or "default" to enable all default
+ * features. These are translated into the appropriate conf_load values
+ * via a struct btf_feature which specifies the associated conf_load
+ * boolean field and whether its initial value (representing the feature
+ * being off) is false or true.
+ *
+ * btf_features is for opting _into_ features so for a case like
+ * conf_load->btf_gen_floats, the translation is simple; the presence
+ * of the "float" feature in --btf_features sets conf_load->btf_gen_floats
+ * to true.
+ *
+ * The more confusing case is for features that are enabled unless
+ * skipping them is specified; for example
+ * conf_load->skip_encoding_btf_type_tag.  By default - to support
+ * the opt-in model of only enabling features the user asks for -
+ * conf_load->skip_encoding_btf_type_tag is set to true (meaning no
+ * type_tags) and it is only set to false if --btf_features contains
+ * the "type_tag" keyword.
+ *
+ * So from the user perspective, all features specified via
+ * --btf_features are enabled, and if a feature is not specified,
+ * it is disabled.
+ *
+ * If --btf_features is not used, the usual pahole values for
+ * BTF encoding apply; we encode type/decl tags, do not encode
+ * floats, etc.  This ensures backwards compatibility.
+ */
+#define BTF_DEFAULT_FEATURE(name, alias, initial_value)		\
+	{ #name, #alias, &conf_load.alias, initial_value, true }
+
+#define BTF_NON_DEFAULT_FEATURE(name, alias, initial_value)	\
+	{ #name, #alias, &conf_load.alias, initial_value, false }
+
+struct btf_feature {
+	const char      *name;
+	const char      *option_alias;
+	bool		*conf_value;
+	bool		initial_value;
+	bool		default_enabled;	/* some nonstandard features may not
+						 * be enabled for --btf_features=default
+						 */
+} btf_features[] = {
+	BTF_DEFAULT_FEATURE(encode_force, btf_encode_force, false),
+	BTF_DEFAULT_FEATURE(var, skip_encoding_btf_vars, true),
+	BTF_DEFAULT_FEATURE(float, btf_gen_floats, false),
+	BTF_DEFAULT_FEATURE(decl_tag, skip_encoding_btf_decl_tag, true),
+	BTF_DEFAULT_FEATURE(type_tag, skip_encoding_btf_type_tag, true),
+	BTF_DEFAULT_FEATURE(enum64, skip_encoding_btf_enum64, true),
+	BTF_DEFAULT_FEATURE(optimized_func, btf_gen_optimized, false),
+	BTF_DEFAULT_FEATURE(consistent_func, skip_encoding_btf_inconsistent_proto, false),
+	BTF_DEFAULT_FEATURE(decl_tag_kfuncs, btf_decl_tag_kfuncs, false),
+	BTF_NON_DEFAULT_FEATURE(reproducible_build, reproducible_build, false),
+	BTF_NON_DEFAULT_FEATURE(distilled_base, btf_gen_distilled_base, false),
+};
+
+#define BTF_MAX_FEATURE_STR	1024
+
+bool set_btf_features_initial;
+
+static void init_btf_features(void)
+{
+	int i;
+
+	/* Only set initial values once, as multiple --btf_features=
+	 * may be specified on command-line, and setting values
+	 * again could clobber values.   The aim is to enable
+	 * all features set across all --btf_features options.
+	 */
+	if (set_btf_features_initial)
+		return;
+	for (i = 0; i < ARRAY_SIZE(btf_features); i++)
+		*btf_features[i].conf_value = btf_features[i].initial_value;
+	set_btf_features_initial = true;
+}
+
+static struct btf_feature *find_btf_feature(char *name)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(btf_features); i++) {
+		if (strcmp(name, btf_features[i].name) == 0)
+			return &btf_features[i];
+	}
+	return NULL;
+}
+
+static void enable_btf_feature(struct btf_feature *feature)
+{
+	/* switch "initial-off" features on, and "initial-on" features
+	 * off; i.e. negate the initial value.
+	 */
+	*feature->conf_value = !feature->initial_value;
+}
+
+static void show_supported_btf_features(FILE *output)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(btf_features); i++) {
+		if (i > 0)
+			fprintf(output, ",");
+		fprintf(output, "%s", btf_features[i].name);
+	}
+	fprintf(output, "\n");
+}
+
+static void btf_features__enable_default(void)
+{
+	for (int i = 0; i < ARRAY_SIZE(btf_features); i++) {
+		if (btf_features[i].default_enabled)
+			enable_btf_feature(&btf_features[i]);
+	}
+}
+
+/* Translate --btf_features=feature1[,feature2] into conf_load values.
+ * Explicitly ignores unrecognized features to allow future specification
+ * of new opt-in features.
+ */
+static void parse_btf_features(const char *features, bool strict)
+{
+	char *saveptr = NULL, *s, *feature_name;
+	char f[BTF_MAX_FEATURE_STR + 1];
+
+	init_btf_features();
+
+	if (strcmp(features, "default") == 0) {
+		btf_features__enable_default();
+		return;
+	}
+
+	// Adding extra features to the set of standard features.
+	if (strstarts(features, "+")) {
+		btf_features__enable_default();
+		++features;
+	}
+
+	strncpy(f, features, BTF_MAX_FEATURE_STR)[BTF_MAX_FEATURE_STR] = '\0';
+	s = f;
+	while ((feature_name = strtok_r(s, ",", &saveptr)) != NULL) {
+		struct btf_feature *feature = find_btf_feature(feature_name);
+
+		if (!feature) {
+			/* --btf_features=default,nonstandard_feature should be
+			 * allowed.
+			 */
+			if (strcmp(feature_name, "default") == 0) {
+				btf_features__enable_default();
+			} else if (strict) {
+				fprintf(stderr, "Feature '%s' in '%s' is not supported.  Supported BTF features are:\n",
+					feature_name, features);
+				show_supported_btf_features(stderr);
+				exit(EXIT_FAILURE);
+			}
+			if (global_verbose)
+				fprintf(stderr, "Ignoring unsupported feature '%s'\n",
+					feature_name);
+		} else {
+			enable_btf_feature(feature);
+		}
+		s = NULL;
+	}
+}
 
 static const struct argp_option pahole__options[] = {
 	{
@@ -1305,6 +1476,12 @@ static const struct argp_option pahole__options[] = {
 		.key  = 'i',
 		.arg  = "CLASS_NAME",
 		.doc  = "Show classes that contains CLASS_NAME"
+	},
+	{
+		.name = "contains_enumerator",
+		.key  = ARGP_contains_enumerator,
+		.arg  = "ENUMERATOR",
+		.doc  = "Show enumerations that contains ENUMERATOR"
 	},
 	{
 		.name = "show_decl_info",
@@ -1655,6 +1832,33 @@ static const struct argp_option pahole__options[] = {
 		.doc = "Skip functions that have multiple inconsistent function prototypes sharing the same name, or that use unexpected registers for parameter values."
 	},
 	{
+		.name = "btf_features",
+		.key = ARGP_btf_features,
+		.arg = "FEATURE_LIST",
+		.doc = "Specify supported BTF features in FEATURE_LIST or 'default' for default set of supported features. See the pahole manual page for the list of supported, default features."
+	},
+	{
+		.name = "supported_btf_features",
+		.key = ARGP_supported_btf_features,
+		.doc = "Show list of btf_features supported by pahole and exit."
+	},
+	{
+		.name = "btf_features_strict",
+		.key = ARGP_btf_features_strict,
+		.arg = "FEATURE_LIST_STRICT",
+		.doc = "Specify supported BTF features in FEATURE_LIST_STRICT or 'default' for default set of supported features.  Unlike --btf_features, unrecognized features will trigger an error."
+	},
+	{
+		.name = "reproducible_build",
+		.key = ARGP_reproducible_build,
+		.doc = "Generate reproducile BTF output"
+	},
+	{
+		.name = "running_kernel_vmlinux",
+		.key = ARGP_running_kernel_vmlinux,
+		.doc = "Search for, possibly getting from a debuginfo server, a vmlinux matching the running kernel build-id (from /sys/kernel/notes)"
+	},
+	{
 		.name = NULL,
 	}
 };
@@ -1685,12 +1889,16 @@ static error_t pahole__options_parser(int key, char *arg,
 		  conf_load.extra_dbg_info = 1;		break;
 	case 'i': find_containers = 1;
 		  class_name = arg;			break;
+	case ARGP_contains_enumerator:
+		  find_enumeration_with_enumerator = true;
+		  enumerator_name = arg;		break;
 	case 'j':
 #if _ELFUTILS_PREREQ(0, 178)
 		  conf_load.nr_jobs = arg ? atoi(arg) :
 					    sysconf(_SC_NPROCESSORS_ONLN) * 1.1;
 #else
-		  fputs("pahole: Multithreading requires elfutils >= 0.178. Continuing with a single thread...\n", stderr);
+		  if (global_verbose)
+			  fputs("pahole: Multithreading requires elfutils >= 0.178. Continuing with a single thread...\n", stderr);
 #endif
 							break;
 	case ARGP_btf_encode_detached:
@@ -1786,9 +1994,9 @@ static error_t pahole__options_parser(int key, char *arg,
 	case ARGP_header_type:
 		conf.header_type = arg;			break;
 	case ARGP_skip_encoding_btf_vars:
-		skip_encoding_btf_vars = true;		break;
+		conf_load.skip_encoding_btf_vars = true;	break;
 	case ARGP_btf_encode_force:
-		btf_encode_force = true;		break;
+		conf_load.btf_encode_force = true;	break;
 	case ARGP_btf_base:
 		base_btf_file = arg;			break;
 	case ARGP_kabi_prefix:
@@ -1797,9 +2005,9 @@ static error_t pahole__options_parser(int key, char *arg,
 	case ARGP_numeric_version:
 		print_numeric_version = true;		break;
 	case ARGP_btf_gen_floats:
-		btf_gen_floats = true;			break;
+		conf_load.btf_gen_floats = true;	break;
 	case ARGP_btf_gen_all:
-		btf_gen_floats = true;			break;
+		parse_btf_features("all", false);	break;
 	case ARGP_with_flexible_array:
 		show_with_flexible_array = true;	break;
 	case ARGP_prettify_input_filename:
@@ -1829,6 +2037,16 @@ static error_t pahole__options_parser(int key, char *arg,
 		conf_load.btf_gen_optimized = true;		break;
 	case ARGP_skip_encoding_btf_inconsistent_proto:
 		conf_load.skip_encoding_btf_inconsistent_proto = true; break;
+	case ARGP_reproducible_build:
+		conf_load.reproducible_build = true;	break;
+	case ARGP_running_kernel_vmlinux:
+		show_running_kernel_vmlinux = true;	break;
+	case ARGP_btf_features:
+		parse_btf_features(arg, false);		break;
+	case ARGP_supported_btf_features:
+		show_supported_btf_features(stdout);	exit(0);
+	case ARGP_btf_features_strict:
+		parse_btf_features(arg, true);		break;
 	default:
 		return ARGP_ERR_UNKNOWN;
 	}
@@ -1848,7 +2066,7 @@ static void do_reorg(struct tag *class, struct cu *cu)
 	int savings;
 	const uint8_t reorg_verbose =
 			show_reorg_steps ? 2 : global_verbose;
-	struct class *clone = class__clone(tag__class(class), NULL);
+	struct class *clone = class__clone(tag__class(class), NULL, cu);
 	if (clone == NULL) {
 		fprintf(stderr, "pahole: out of memory!\n");
 		exit(EXIT_FAILURE);
@@ -1877,7 +2095,7 @@ static void do_reorg(struct tag *class, struct cu *cu)
 	} else
 		putchar('\n');
 
-	 class__delete(clone);
+	 class__delete(clone, cu);
 }
 
 static int instance__fprintf_hexdump_value(void *instance, int _sizeof, FILE *fp)
@@ -2001,35 +2219,36 @@ static struct enumerator *enumerations__lookup_entry_from_value(struct list_head
 	return NULL;
 }
 
-static int64_t enumeration__lookup_enumerator(struct type *enumeration, const char *enumerator)
+static struct enumerator *enumeration__find_enumerator(struct type *enumeration, const char *name)
 {
 	struct enumerator *entry;
 
 	type__for_each_enumerator(enumeration, entry) {
 		const char *entry_name = enumerator__name(entry);
 
-		if (!strcmp(entry_name, enumerator))
-			return entry->value;
+		if (!strcmp(entry_name, name))
+			return entry;
 
 		if (enumeration->member_prefix_len &&
-		    !strcmp(entry_name + enumeration->member_prefix_len, enumerator))
-			return entry->value;
+		    !strcmp(entry_name + enumeration->member_prefix_len, name))
+			return entry;
 	}
 
-	return -1;
+	return NULL;
 }
 
-static int64_t enumerations__lookup_enumerator(struct list_head *enumerations, const char *enumerator)
+static struct enumerator *enumerations__find_enumerator(struct list_head *enumerations, const char *name)
 {
 	struct tag_cu_node *pos;
 
 	list_for_each_entry(pos, enumerations, node) {
-		int64_t value = enumeration__lookup_enumerator(tag__type(pos->tc.tag), enumerator);
-		if (value != -1)
-			return value;
+		struct enumerator *enumerator = enumeration__find_enumerator(tag__type(pos->tc.tag), name);
+
+		if (enumerator != NULL)
+			return enumerator;
 	}
 
-	return -1;
+	return NULL;
 }
 
 static int base_type__fprintf_enum_value(void *instance, int _sizeof, struct list_head *enumerations, FILE *fp)
@@ -2664,7 +2883,7 @@ out:
 	return printed;
 }
 
-static int class_member_filter__parse(struct class_member_filter *filter, struct type *type, char *sfilter)
+static int class_member_filter__parse(struct class_member_filter *filter, struct type *type, const struct cu *cu, char *sfilter)
 {
 	const char *member_name = sfilter;
 	char *sep = strstr(sfilter, "==");
@@ -2713,33 +2932,41 @@ static int class_member_filter__parse(struct class_member_filter *filter, struct
 
 	// If t he filter member is the 'type=' one:
 
-	if (list_empty(&type->type_enum) || type->type_member != filter->left) {
+	if (list_empty(&type->type_enum)) {
+		if (global_verbose) {
+			fprintf(stderr, "Symbolic right operand in '%s' but no way to resolve it to a number (type_enum empty or hasn't found any so far) at CU '%s')\n",
+				sfilter, cu->name);
+		}
+		return -1;
+	}
+
+	if (type->type_member != filter->left) {
 		if (global_verbose)
-			fprintf(stderr, "Symbolic right operand in '%s' but no way to resolve it to a number (type= + type_enum= so far)\n", sfilter);
+			fprintf(stderr, "type->type_member (%p) != filter->left (%p)\n", type->type_member, filter->left);
 		return -1;
 	}
 
 	enumerations__calc_prefix(&type->type_enum);
 
-	int64_t enumerator_value = enumerations__lookup_enumerator(&type->type_enum, value);
+	struct enumerator * enumerator = enumerations__find_enumerator(&type->type_enum, value);
 
-	if (enumerator_value < 0) {
+	if (enumerator == NULL) {
 		if (global_verbose)
 			fprintf(stderr, "Couldn't resolve right operand ('%s') in '%s' with the specified 'type=%s' and type_enum' \n",
 				value, sfilter, class_member__name(type->type_member));
 		return -1;
 	}
 
-	filter->right = enumerator_value;
+	filter->right = enumerator->value;
 
 	return 0;
 }
 
-static struct class_member_filter *class_member_filter__new(struct type *type, char *sfilter)
+static struct class_member_filter *class_member_filter__new(struct type *type, const struct cu *cu, char *sfilter)
 {
 	struct class_member_filter *filter = zalloc(sizeof(*filter));
 
-	if (filter && class_member_filter__parse(filter, type, sfilter)) {
+	if (filter && class_member_filter__parse(filter, type, cu, sfilter)) {
 		free(filter);
 		filter = NULL;
 	}
@@ -2961,10 +3188,34 @@ out:
 
 static struct type_instance *header;
 
+static bool print_enumeration_with_enumerator(struct cu *cu, const char *name)
+{
+	struct type *enumeration;
+	uint32_t id;
+
+	cu__for_each_enumeration(cu, id, enumeration) {
+		if (enumeration__find_enumerator(enumeration, name) != NULL) {
+			enumeration__fprintf(type__tag(enumeration), &conf, stdout);
+			fputc('\n', stdout);
+			return true;
+		}
+	}
+
+	return false;
+}
+
 struct thread_data {
 	struct btf *btf;
 	struct btf_encoder *encoder;
 };
+
+static int pahole_threads_prepare_reproducible_build(struct conf_load *conf, int nr_threads, void **thr_data)
+{
+	for (int i = 0; i < nr_threads; i++)
+		thr_data[i] = NULL;
+
+	return 0;
+}
 
 static int pahole_threads_prepare(struct conf_load *conf, int nr_threads, void **thr_data)
 {
@@ -3046,6 +3297,10 @@ static enum load_steal_kind pahole_stealer(struct cu *cu,
 		cu__fprintf_ptr_table_stats_csv(cu, stderr);
 	}
 
+	if (find_enumeration_with_enumerator &&
+	    print_enumeration_with_enumerator(cu, enumerator_name))
+		return LSK__DELETE; // Maybe we can find this in several CUs, so don't stop it
+
 	if (btf_encode) {
 		static pthread_mutex_t btf_lock = PTHREAD_MUTEX_INITIALIZER;
 		struct btf_encoder *encoder;
@@ -3063,8 +3318,8 @@ static enum load_steal_kind pahole_stealer(struct cu *cu,
 			 * And, it is used by the thread
 			 * create it.
 			 */
-			btf_encoder = btf_encoder__new(cu, detached_btf_filename, conf_load->base_btf, skip_encoding_btf_vars,
-						       btf_encode_force, btf_gen_floats, global_verbose);
+			btf_encoder = btf_encoder__new(cu, detached_btf_filename, conf_load->base_btf,
+						       global_verbose, conf_load);
 			if (btf_encoder && thr_data) {
 				struct thread_data *thread = thr_data;
 
@@ -3072,7 +3327,10 @@ static enum load_steal_kind pahole_stealer(struct cu *cu,
 				thread->btf = btf_encoder__btf(btf_encoder);
 			}
 		}
-		pthread_mutex_unlock(&btf_lock);
+
+		// Reproducible builds don't have multiple btf_encoders, so we need to keep the lock until we encode BTF for this CU.
+		if (thr_data)
+			pthread_mutex_unlock(&btf_lock);
 
 		if (!btf_encoder) {
 			ret = LSK__STOP_LOADING;
@@ -3093,10 +3351,8 @@ static enum load_steal_kind pahole_stealer(struct cu *cu,
 				thread->encoder =
 					btf_encoder__new(cu, detached_btf_filename,
 							 NULL,
-							 skip_encoding_btf_vars,
-							 btf_encode_force,
-							 btf_gen_floats,
-							 global_verbose);
+							 global_verbose,
+							 conf_load);
 				thread->btf = btf_encoder__btf(thread->encoder);
 			}
 			encoder = thread->encoder;
@@ -3104,12 +3360,35 @@ static enum load_steal_kind pahole_stealer(struct cu *cu,
 			encoder = btf_encoder;
 		}
 
+		// Since we don't have yet a way to parallelize the BTF encoding, we
+		// need to ask the loader for the next CU that we can process, one
+		// that is loaded and is in order, if the next one isn't yet loaded,
+		// then return to let the DWARF loader thread to load the next one,
+		// eventually all will get processed, even if when all DWARF loading
+		// threads finish.
+		if (conf_load->reproducible_build) {
+			ret = LSK__KEEPIT; // we're not processing the cu passed to this
+					  // function, so keep it.
+			cu = cus__get_next_processable_cu(cus);
+			if (cu == NULL)
+				goto out_btf;
+		}
+
 		ret = btf_encoder__encode_cu(encoder, cu, conf_load);
 		if (ret < 0) {
 			fprintf(stderr, "Encountered error while encoding BTF.\n");
 			exit(1);
 		}
+
+		if (conf_load->reproducible_build) {
+			ret = LSK__KEEPIT; // we're not processing the cu passed to this function, so keep it.
+			// Kinda equivalent to LSK__DELETE since we processed this, but we can't delete it
+			// as we stash references to entries in CUs for 'struct function' in btf_encoder__add_saved_funcs()
+			// and btf_encoder__save_func(), so we can't delete them here. - Alan Maguire
+		}
 out_btf:
+		if (!thr_data) // See comment about reproducibe_build above
+			pthread_mutex_unlock(&btf_lock);
 		return ret;
 	}
 #if 0
@@ -3196,12 +3475,14 @@ out_btf:
 			}
 		}
 
-		if (prototype->type_enum) {
+		if (prototype->type_enum && !prototype->type_enum_resolved) {
 			prototype->type_enum_resolved = type__find_type_enum(type, cu, prototype->type_enum) == 0;
+			if (!prototype->type_enum_resolved)
+				return ret;
 		}
 
 		if (prototype->filter) {
-			type->filter = class_member_filter__new(type, prototype->filter);
+			type->filter = class_member_filter__new(type, cu, prototype->filter);
 			if (type->filter == NULL) {
 				fprintf(stderr, "pahole: invalid filter '%s' for '%s'\n",
 					prototype->filter, prototype->name);
@@ -3408,6 +3689,24 @@ out_free:
 	return ret;
 }
 
+static int cus__flush_reproducible_build(struct cus *cus, struct btf_encoder *encoder, struct conf_load *conf_load)
+{
+	int err = 0;
+
+	while (true) {
+		struct cu *cu = cus__get_next_processable_cu(cus);
+
+		if (cu == NULL)
+			break;
+
+		err = btf_encoder__encode_cu(encoder, cu, conf_load);
+		if (err < 0)
+			break;
+	}
+
+	return err;
+}
+
 int main(int argc, char *argv[])
 {
 	int err, remaining, rc = EXIT_FAILURE;
@@ -3415,6 +3714,21 @@ int main(int argc, char *argv[])
 	if (argp_parse(&pahole__argp, argc, argv, 0, &remaining, NULL)) {
 		argp_help(&pahole__argp, stderr, ARGP_HELP_SEE, argv[0]);
 		goto out;
+	}
+
+	if (show_running_kernel_vmlinux) {
+		const char *vmlinux = vmlinux_path__find_running_kernel();
+
+		if (vmlinux) {
+			fprintf(stdout, "%s\n", vmlinux);
+			rc = EXIT_SUCCESS;
+		} else {
+			fputs("pahole: couldn't find a vmlinux that matches the running kernel\n"
+			      "HINT: Maybe you're inside a container or missing a debuginfo package?\n",
+			      stderr);
+		}
+
+		return rc;
 	}
 
 	if (languages.str && parse_languages())
@@ -3468,7 +3782,7 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	struct cus *cus = cus__new();
+	cus = cus__new();
 	if (cus == NULL) {
 		fputs("pahole: insufficient memory\n", stderr);
 		goto out_dwarves_exit;
@@ -3477,9 +3791,19 @@ int main(int argc, char *argv[])
 	memset(tab, ' ', sizeof(tab) - 1);
 
 	conf_load.steal = pahole_stealer;
+
+	if (languages.exclude)
+		conf_load.early_cu_filter = cu__filter;
+
 	conf_load.thread_exit = pahole_thread_exit;
-	conf_load.threads_prepare = pahole_threads_prepare;
-	conf_load.threads_collect = pahole_threads_collect;
+
+	if (conf_load.reproducible_build) {
+		conf_load.threads_prepare = pahole_threads_prepare_reproducible_build;
+		conf_load.threads_collect = NULL;
+	} else {
+		conf_load.threads_prepare = pahole_threads_prepare;
+		conf_load.threads_collect = pahole_threads_collect;
+	}
 
 	// Make 'pahole --header type < file' a shorter form of 'pahole -C type --count 1 < file'
 	if (conf.header_type && !class_name && prettify_input) {
@@ -3512,6 +3836,12 @@ try_sole_arg_as_class_names:
 	if (err != 0) {
 		if (class_name == NULL && !btf_encode && !ctf_encode) {
 			class_name = argv[remaining];
+
+			if (class_name == NULL) {
+				fprintf(stderr, "pahole: couldn't find any debug information on this system.\n");
+				goto out_dwarves_exit;
+			}
+
 			if (access(class_name, R_OK) == 0) {
 				fprintf(stderr, "pahole: file '%s' has no %s type information.\n",
 						class_name, conf_load.format_path ?: "supported");
@@ -3567,6 +3897,12 @@ try_sole_arg_as_class_names:
 	header = NULL;
 
 	if (btf_encode && btf_encoder) { // maybe all CUs were filtered out and thus we don't have an encoder?
+		if (conf_load.reproducible_build &&
+		    cus__flush_reproducible_build(cus, btf_encoder, &conf_load) < 0) {
+			fprintf(stderr, "Encountered error while encoding BTF.\n");
+			exit(1);
+		}
+
 		err = btf_encoder__encode(btf_encoder);
 		if (err) {
 			fputs("Failed to encode BTF\n", stderr);

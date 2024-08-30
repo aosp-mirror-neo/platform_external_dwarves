@@ -49,6 +49,7 @@ struct fn_stats {
 	uint32_t	 nr_expansions;
 	uint32_t	 size_expansions;
 	uint32_t	 nr_files;
+	bool		 printed;
 };
 
 static struct fn_stats *fn_stats__new(struct tag *tag, const struct cu *cu)
@@ -95,11 +96,13 @@ static void fn_stats__delete_list(void)
 	}
 }
 
-static void fn_stats__add(struct tag *tag, const struct cu *cu)
+static struct fn_stats *fn_stats__add(struct tag *tag, const struct cu *cu)
 {
 	struct fn_stats *fns = fn_stats__new(tag, cu);
 	if (fns != NULL)
 		list_add(&fns->node, &fn_stats__list);
+
+	return fns;
 }
 
 static void fn_stats_inline_exps_fmtr(const struct fn_stats *stats)
@@ -275,15 +278,17 @@ static bool function__filter(struct function *function, struct cu *cu)
 	return false;
 }
 
-static int cu_unique_iterator(struct cu *cu, void *cookie __maybe_unused)
+static int cu_unique_iterator(struct cu *cu, void *cookie)
 {
+	bool is_btf = cookie != NULL;
+
 	cu__account_inline_expansions(cu);
 
 	struct function *pos;
 	uint32_t id;
 
 	cu__for_each_function(cu, id, pos)
-		if (!function__filter(pos, cu))
+		if (is_btf || !function__filter(pos, cu))
 			fn_stats__add(function__tag(pos), cu);
 	return 0;
 }
@@ -364,7 +369,12 @@ static void function__show(struct function *func, struct cu *cu)
 {
 	struct tag *tag = function__tag(func);
 
-	if (func->abstract_origin || func->external)
+	if (func->abstract_origin || func->declaration)
+		return;
+
+	struct fn_stats *fstats = fn_stats__find(func->name);
+
+	if (fstats && fstats->printed)
 		return;
 
 	if (expand_types)
@@ -391,6 +401,11 @@ static void function__show(struct function *func, struct cu *cu)
 	putchar('\n');
 	if (show_variables || show_inline_expansions)
 		function__fprintf_stats(tag, cu, &conf, stdout);
+
+	if (!fstats)
+		fstats = fn_stats__add(tag, cu);
+	if (fstats)
+		fstats->printed = true;
 }
 
 static int cu_function_iterator(struct cu *cu, void *cookie)
@@ -758,7 +773,8 @@ try_sole_arg_as_function_name:
 	}
 
 
-	cus__for_each_cu(cus, cu_unique_iterator, NULL, NULL);
+	bool is_btf = conf_load.format_path && strcasecmp(conf_load.format_path, "btf") == 0;
+	cus__for_each_cu(cus, cu_unique_iterator, is_btf ? (void *)1 : NULL, NULL);
 
 	if (addr) {
 		struct cu *cu;

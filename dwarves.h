@@ -19,12 +19,34 @@
 #include "list.h"
 #include "rbtree.h"
 
+/* Force a compilation error if condition is true, but also produce a
+   result (of value 0 and type size_t), so the expression can be used
+   e.g. in a structure initializer (or where-ever else comma expressions
+   aren't permitted). */
+#define BUILD_BUG_ON_ZERO(e) (sizeof(struct { int:-!!(e); }))
+
+/* Are two types/vars the same type (ignoring qualifiers)? */
+#ifndef __same_type
+# define __same_type(a, b) __builtin_types_compatible_p(typeof(a), typeof(b))
+#endif
+
+/* &a[0] degrades to a pointer: a different type from an array */
+#define __must_be_array(a)      BUILD_BUG_ON_ZERO(__same_type((a), &(a)[0]))
+
+#define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]) + __must_be_array(arr))
+
 struct cu;
 
 enum load_steal_kind {
 	LSK__KEEPIT,
 	LSK__DELETE,
 	LSK__STOP_LOADING,
+};
+
+enum cu_state {
+	CU__UNPROCESSED,
+	CU__LOADED,
+	CU__PROCESSING,
 };
 
 /*
@@ -50,6 +72,7 @@ struct conf_load {
 	enum load_steal_kind	(*steal)(struct cu *cu,
 					 struct conf_load *conf,
 					 void *thr_data);
+	struct cu *		(*early_cu_filter)(struct cu *cu);
 	int			(*thread_exit)(struct conf_load *conf, void *thr_data);
 	void			*cookie;
 	char			*format_path;
@@ -68,6 +91,12 @@ struct conf_load {
 	bool			skip_encoding_btf_enum64;
 	bool			btf_gen_optimized;
 	bool			skip_encoding_btf_inconsistent_proto;
+	bool			skip_encoding_btf_vars;
+	bool			btf_gen_floats;
+	bool			btf_encode_force;
+	bool			reproducible_build;
+	bool			btf_decl_tag_kfuncs;
+	bool			btf_gen_distilled_base;
 	uint8_t			hashtable_bits;
 	uint8_t			max_hashtable_bits;
 	uint16_t		kabi_prefix_len;
@@ -151,7 +180,16 @@ int cus__fprintf_load_files_err(struct cus *cus, const char *tool,
 int cus__load_dir(struct cus *cus, struct conf_load *conf,
 		  const char *dirname, const char *filename_mask,
 		  const int recursive);
+void __cus__add(struct cus *cus, struct cu *cu);
 void cus__add(struct cus *cus, struct cu *cu);
+
+void __cus__remove(struct cus *cus, struct cu *cu);
+void cus__remove(struct cus *cus, struct cu *cu);
+
+struct cu *cus__get_next_processable_cu(struct cus *cus);
+
+void cus__set_cu_state(struct cus *cus, struct cu *cu, enum cu_state state);
+
 void cus__print_error_msg(const char *progname, const struct cus *cus,
 			  const char *filename, const int err);
 struct cu *cus__find_pair(struct cus *cus, const char *name);
@@ -161,6 +199,8 @@ struct tag *cus__find_struct_by_name(struct cus *cus, struct cu **cu,
 				     type_id_t *id);
 struct tag *cus__find_struct_or_union_by_name(struct cus *cus, struct cu **cu,
 					      const char *name, const int include_decls, type_id_t *id);
+void *cu__tag_alloc(struct cu *cu, size_t size);
+void cu__tag_free(struct cu *cu, struct tag *tag);
 struct tag *cu__find_type_by_name(const struct cu *cu, const char *name, const int include_decls, type_id_t *idp);
 struct tag *cus__find_type_by_name(struct cus *cus, struct cu **cu, const char *name,
 				   const int include_decls, type_id_t *id);
@@ -232,6 +272,8 @@ struct debug_fmt_ops {
 					     const struct cu *cu);
 	unsigned long long (*tag__orig_id)(const struct tag *tag,
 					   const struct cu *cu);
+	void		   *(*tag__alloc)(struct cu *cu, size_t size);
+	void		   (*tag__free)(struct tag *tag, struct cu *cu);
 	void		   (*cu__delete)(struct cu *cu);
 	bool		   has_alignment_info;
 };
@@ -262,6 +304,8 @@ struct cu {
 	uint8_t		 little_endian:1;
 	uint8_t		 nr_register_params;
 	int		 register_params[ARCH_MAX_REGISTER_PARAMS];
+	int		 functions_saved;
+	enum cu_state	 state;
 	uint16_t	 language;
 	unsigned long	 nr_inline_expansions;
 	size_t		 size_inline_expansions;
@@ -363,6 +407,19 @@ int lang__str2int(const char *lang);
 		else
 
 /**
+ * cu__for_each_enumeration - iterate thru all the enumeration tags
+ * @cu: enumeration cu instance to iterate
+ * @pos: enumeration iterator
+ * @id: type_id_t id
+ */
+#define cu__for_each_enumeration(cu, id, pos)				\
+	for (id = 1; id < cu->types_table.nr_entries; ++id)		\
+		if (!(pos = tag__type(cu->types_table.entries[id])) ||	\
+		    !tag__is_enumeration(type__tag(pos)))		\
+			continue;					\
+		else
+
+/**
  * cu__for_each_function - iterate thru all the function tags
  * @cu: struct cu instance to iterate
  * @pos: struct function iterator
@@ -400,6 +457,19 @@ int lang__str2int(const char *lang);
 			continue;			\
 		else
 
+/**
+ * cu__for_each_namespace - iterate thru all the global namespace tags
+ * @cu: struct cu instance to iterate
+ * @pos: struct tag iterator
+ * @id: uint32_t tag id
+ */
+#define cu__for_each_namespace(cu, id, pos)		\
+	for (id = 0; id < cu->tags_table.nr_entries; ++id) \
+		if (!(pos = cu->tags_table.entries[id]) || \
+		    !tag__is_namespace(pos))		\
+			continue;			\
+		else
+
 int cu__add_tag(struct cu *cu, struct tag *tag, uint32_t *id);
 int cu__add_tag_with_id(struct cu *cu, struct tag *tag, uint32_t id);
 int cu__table_add_tag(struct cu *cu, struct tag *tag, uint32_t *id);
@@ -434,16 +504,18 @@ int cu__for_all_tags(struct cu *cu,
 /** struct tag - basic representation of a debug info element
  * @priv - extra data, for instance, DWARF offset, id, decl_{file,line}
  * @top_level -
+ * @shared_tags: used by struct namespace
  */
 struct tag {
 	struct list_head node;
 	type_id_t	 type;
 	uint16_t	 tag;
-	bool		 visited;
-	bool		 top_level;
-	bool		 has_btf_type_tag;
-	uint16_t	 recursivity_level;
-	void		 *priv;
+	bool		 visited:1;
+	bool		 top_level:1;
+	bool		 has_btf_type_tag:1;
+	bool		 shared_tags:1;
+	uint8_t		 recursivity_level;
+	const char	 *attribute;
 };
 
 // To use with things like type->type_enum == perf_event_type+perf_user_event_type
@@ -452,7 +524,7 @@ struct tag_cu {
 	struct cu	 *cu;
 };
 
-void tag__delete(struct tag *tag);
+void tag__delete(struct tag *tag, struct cu *cu);
 
 static inline int tag__is_enumeration(const struct tag *tag)
 {
@@ -690,8 +762,6 @@ static inline struct btf_type_tag_type *tag__btf_type_tag(struct tag *tag)
 struct namespace {
 	struct tag	 tag;
 	const char	 *name;
-	uint16_t	 nr_tags;
-	uint8_t		 shared_tags;
 	struct list_head tags;
 	struct list_head annots;
 };
@@ -701,7 +771,12 @@ static inline struct namespace *tag__namespace(const struct tag *tag)
 	return (struct namespace *)tag;
 }
 
-void namespace__delete(struct namespace *nspace);
+void namespace__delete(struct namespace *nspace, struct cu *cu);
+
+static inline __pure bool namespace__shared_tags(struct namespace *nspace)
+{
+	return nspace->tag.shared_tags;
+}
 
 /**
  * namespace__for_each_tag - iterate thru all the tags
@@ -830,7 +905,7 @@ static inline struct lexblock *tag__lexblock(const struct tag *tag)
 	return (struct lexblock *)tag;
 }
 
-void lexblock__delete(struct lexblock *lexblock);
+void lexblock__delete(struct lexblock *lexblock, struct cu *cu);
 
 struct function;
 
@@ -862,6 +937,59 @@ static inline const char *parameter__name(const struct parameter *parm)
 	return parm->name;
 }
 
+/* struct template_type_param - parameters to a template, stored in 'struct type'
+ */
+struct template_type_param {
+	struct tag	 tag;
+	const char	 *name;
+};
+
+void template_type_param__delete(struct template_type_param *ttparam, struct cu *cu);
+
+struct template_value_param {
+	struct tag	 tag;
+	const char	 *name;
+	uint64_t	 const_value;
+	uint64_t	 default_value;
+};
+
+void template_value_param__delete(struct template_value_param *ttparam, struct cu *cu);
+
+/* struct template_parameter_pack - list of DW_TAG_template_type_param
+ */
+
+struct template_parameter_pack {
+	struct tag	 tag;
+	const char	 *name;
+	struct list_head params;
+};
+
+void template_parameter_pack__delete(struct template_parameter_pack *pack, struct cu *cu);
+
+static inline struct template_parameter_pack *tag__template_parameter_pack(const struct tag *tag)
+{
+	return (struct template_parameter_pack *)tag;
+}
+
+void template_parameter_pack__add(struct template_parameter_pack *pack, struct template_type_param *param);
+
+/* struct formal_parameter_pack - list of DW_TAG_formal_parameter
+ */
+
+struct formal_parameter_pack {
+	struct tag	 tag;
+	struct list_head params;
+};
+
+void formal_parameter_pack__delete(struct formal_parameter_pack *pack, struct cu *cu);
+
+static inline struct formal_parameter_pack *tag__formal_parameter_pack(const struct tag *tag)
+{
+	return (struct formal_parameter_pack *)tag;
+}
+
+void formal_parameter_pack__add(struct formal_parameter_pack *pack, struct parameter *param);
+
 /*
  * tag.tag can be DW_TAG_subprogram_type or DW_TAG_subroutine_type.
  */
@@ -875,6 +1003,10 @@ struct ftype {
 	uint8_t		 unexpected_reg:1;
 	uint8_t		 processed:1;
 	uint8_t		 inconsistent_proto:1;
+	struct list_head template_type_params;
+	struct list_head template_value_params;
+	struct template_parameter_pack *template_parameter_pack;
+	struct formal_parameter_pack *formal_parameter_pack;
 };
 
 static inline struct ftype *tag__ftype(const struct tag *tag)
@@ -882,7 +1014,7 @@ static inline struct ftype *tag__ftype(const struct tag *tag)
 	return (struct ftype *)tag;
 }
 
-void ftype__delete(struct ftype *ftype);
+void ftype__delete(struct ftype *ftype, struct cu *cu);
 
 /**
  * ftype__for_each_parameter - iterate thru all the parameters
@@ -911,6 +1043,9 @@ void ftype__delete(struct ftype *ftype);
 	list_for_each_entry_safe_reverse(pos, n, &(ftype)->parms, tag.node)
 
 void ftype__add_parameter(struct ftype *ftype, struct parameter *parm);
+void ftype__add_template_type_param(struct ftype *ftype, struct template_type_param *param);
+void ftype__add_template_value_param(struct ftype *ftype, struct template_value_param *param);
+
 size_t ftype__fprintf(const struct ftype *ftype, const struct cu *cu,
 		      const char *name, const int inlined,
 		      const int is_pointer, const int type_spacing, bool is_prototype,
@@ -958,7 +1093,7 @@ static inline struct tag *function__tag(const struct function *func)
 	return (struct tag *)func;
 }
 
-void function__delete(struct function *func);
+void function__delete(struct function *func, struct cu *cu);
 
 static __pure inline int tag__is_function(const struct tag *tag)
 {
@@ -1026,7 +1161,10 @@ static inline int function__inlined(const struct function *func)
  * @alignment - DW_AT_alignement, zero if not present, gcc emits since circa 7.3.1
  * @accessibility - DW_ACCESS_{public,protected,private}
  * @virtuality - DW_VIRTUALITY_{none,virtual,pure_virtual}
- * @hole - If there is a hole before the next one (or the end of the struct)
+ * @hole - If there is a hole before the next one (or the end of the struct).
+ * 	   A negative hole may happen when there is padding on an DW_TAG_inheritance,
+ * 	   i.e. in a ancestor type and the compiler puts the class member of the
+ * 	   derived class to use that padding.
  * @has_bit_offset: Don't recalcule this, it came from the debug info (DWARF5's DW_AT_data_bit_offset)
  */
 struct class_member {
@@ -1035,22 +1173,22 @@ struct class_member {
 	uint32_t	 bit_offset;
 	uint32_t	 bit_size;
 	uint32_t	 byte_offset;
+	int		 hole;
 	size_t		 byte_size;
 	int8_t		 bitfield_offset;
 	uint8_t		 bitfield_size;
 	uint8_t		 bit_hole;
 	uint8_t		 bitfield_end:1;
-	uint64_t	 const_value;
-	uint32_t	 alignment;
 	uint8_t		 visited:1;
 	uint8_t		 is_static:1;
 	uint8_t		 has_bit_offset:1;
 	uint8_t		 accessibility:2;
 	uint8_t		 virtuality:2;
-	uint16_t	 hole;
+	uint32_t	 alignment;
+	uint64_t	 const_value;
 };
 
-void class_member__delete(struct class_member *member);
+void class_member__delete(struct class_member *member, struct cu *cu);
 
 static inline struct class_member *tag__class_member(const struct tag *tag)
 {
@@ -1111,13 +1249,16 @@ struct type {
 	uint16_t	 member_prefix_len;
 	uint16_t	 max_tag_name_len;
 	uint16_t	 natural_alignment;
-	uint8_t		 suffix_disambiguation;
+	uint8_t		 suffix_disambiguation:1;
 	uint8_t		 packed_attributes_inferred:1;
 	uint8_t		 declaration:1;
 	uint8_t		 definition_emitted:1;
 	uint8_t		 fwd_decl_emitted:1;
 	uint8_t		 resized:1;
 	uint8_t		 is_signed_enum:1;
+	struct list_head template_type_params;
+	struct list_head template_value_params;
+	struct template_parameter_pack *template_parameter_pack;
 };
 
 void __type__init(struct type *type);
@@ -1134,7 +1275,7 @@ static inline struct tag *type__tag(const struct type *type)
 	return (struct tag *)type;
 }
 
-void type__delete(struct type *type);
+void type__delete(struct type *type, struct cu *cu);
 
 static inline struct class_member *type__first_member(struct type *type)
 {
@@ -1161,7 +1302,7 @@ static inline struct class_member *class_member__next(struct class_member *membe
  */
 #define type__for_each_enumerator(type, pos) \
 	struct list_head *__type__for_each_enumerator_head = \
-		(type)->namespace.shared_tags ? \
+		namespace__shared_tags(&(type)->namespace) ? \
 			(type)->namespace.tags.next : \
 			&(type)->namespace.tags; \
 	list_for_each_entry(pos, __type__for_each_enumerator_head, tag.node)
@@ -1173,7 +1314,7 @@ static inline struct class_member *class_member__next(struct class_member *membe
  * @n: struct enumerator temp iterator
  */
 #define type__for_each_enumerator_safe_reverse(type, pos, n)		   \
-	if ((type)->namespace.shared_tags) /* Do nothing */ ; else \
+	if (namespace__shared_tags(&(type)->namespace)) /* Do nothing */ ; else \
 	list_for_each_entry_safe_reverse(pos, n, &(type)->namespace.tags, tag.node)
 
 /**
@@ -1235,6 +1376,9 @@ static inline struct class_member *class_member__next(struct class_member *membe
 	list_for_each_entry_safe_reverse(pos, n, &(type)->namespace.tags, tag.node)
 
 void type__add_member(struct type *type, struct class_member *member);
+void type__add_template_type_param(struct type *type, struct template_type_param *ttparm);
+void type__add_template_value_param(struct type *type, struct template_value_param *tvparam);
+
 struct class_member *
 	type__find_first_biggest_size_base_type_member(struct type *type,
 						       const struct cu *cu);
@@ -1278,8 +1422,8 @@ static inline struct tag *class__tag(const struct class *cls)
 	return (struct tag *)cls;
 }
 
-struct class *class__clone(const struct class *from, const char *new_class_name);
-void class__delete(struct class *cls);
+struct class *class__clone(const struct class *from, const char *new_class_name, struct cu *cu);
+void class__delete(struct class *cls, struct cu *cu);
 
 static inline struct list_head *class__tags(struct class *cls)
 {
@@ -1450,7 +1594,7 @@ static inline const char *enumerator__name(const struct enumerator *enumerator)
 	return enumerator->name;
 }
 
-void enumeration__delete(struct type *type);
+void enumeration__delete(struct type *type, struct cu *cu);
 void enumeration__add(struct type *type, struct enumerator *enumerator);
 size_t enumeration__fprintf(const struct tag *tag_enum,
 			    const struct conf_fprintf *conf, FILE *fp);
@@ -1460,6 +1604,8 @@ void dwarves__exit(void);
 void dwarves__resolve_cacheline_size(const struct conf_load *conf, uint16_t user_cacheline_size);
 
 const char *dwarf_tag_name(const uint32_t tag);
+
+const char *vmlinux_path__find_running_kernel(void);
 
 struct argp_state;
 

@@ -151,6 +151,9 @@ static struct conf_fprintf conf_fprintf__defaults = {
 
 const char tabs[] = "\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t";
 
+static size_t union__fprintf(struct type *type, const struct cu *cu,
+			     const struct conf_fprintf *conf, FILE *fp);
+
 /*
  * In dwarves_emit.c we can call type__emit() using a locally setup conf_fprintf for which
  * the conf->cacheline_size member is not setup and is thus zero, so check for that and
@@ -296,6 +299,36 @@ static size_t string_type__fprintf(const struct tag *tag, const char *name,
 	return fprintf(fp, "string %*s[%u]", conf->type_spacing - 5, name, st->nr_entries);
 }
 
+/*
+ * Here we're printing either:
+ *
+ * union bar baz;
+ *
+ * I.e. a variable or a class member, or:
+ *
+ * union {
+ * 	u32 a;
+ * 	u16 b;
+ * } baz;
+ *
+ * I.e. a "inline" union, with or without that 'baz' name (unnamed union member),
+ * or we are expanding unions, i.e. using 'pahole -E/--expand_types'.
+ */
+static size_t union_decl__fprintf(const struct tag *type, const struct cu *cu, const char *name,
+				  const struct conf_fprintf *conf, FILE *fp)
+{
+	struct type *ctype = tag__type(type);
+
+	if (type__name(ctype) != NULL && !conf->expand_types)
+		return fprintf(fp, "union %-*s %s", conf->type_spacing - 6, type__name(ctype), name ?: "");
+
+	struct conf_fprintf tconf = *conf;
+	tconf.type_spacing -= 8;
+	tconf.suffix = name;
+
+	return union__fprintf(ctype, cu, &tconf, fp);
+}
+
 size_t typedef__fprintf(const struct tag *tag, const struct cu *cu,
 			const struct conf_fprintf *conf, FILE *fp)
 {
@@ -347,14 +380,21 @@ next_type:
 	case DW_TAG_structure_type: {
 		struct type *ctype = tag__type(tag_type);
 
-		if (type__name(ctype) != NULL)
+		if (type__name(ctype) != NULL && !pconf->expand_types)
 			return printed + fprintf(fp, "struct %s %s", type__name(ctype), type__name(type));
 
 		struct conf_fprintf tconf = *pconf;
+		struct class *cclass = tag__class(tag_type);
 
+		if (!tconf.suppress_comments)
+			class__find_holes(cclass);
+
+		tconf.type_spacing -= 8;
 		tconf.suffix = type__name(type);
-		return printed + __class__fprintf(tag__class(tag_type), cu, &tconf, fp);
+		return printed + __class__fprintf(cclass, cu, &tconf, fp);
 	}
+	case DW_TAG_union_type:
+		return printed + union_decl__fprintf(tag_type, cu, type__name(type), pconf, fp);
 	case DW_TAG_enumeration_type: {
 		struct type *ctype = tag__type(tag_type);
 
@@ -699,9 +739,6 @@ static type_id_t skip_llvm_annotations(const struct cu *cu, type_id_t id)
 	return id;
 }
 
-static size_t union__fprintf(struct type *type, const struct cu *cu,
-			     const struct conf_fprintf *conf, FILE *fp);
-
 static size_t type__fprintf(struct tag *type, const struct cu *cu,
 			    const char *name, const struct conf_fprintf *conf,
 			    FILE *fp)
@@ -889,19 +926,12 @@ print_modifier: {
 		}
 		break;
 	case DW_TAG_union_type:
-		ctype = tag__type(type);
-
-		if (type__name(ctype) != NULL && !expand_types) {
-			printed += fprintf(fp, "union %-*s %s", tconf.type_spacing - 6, type__name(ctype), name ?: "");
-		} else {
-			tconf.type_spacing -= 8;
-			printed += union__fprintf(ctype, cu, &tconf, fp);
-		}
+		printed += union_decl__fprintf(type, cu, name, &tconf, fp);
 		break;
 	case DW_TAG_enumeration_type:
 		ctype = tag__type(type);
 
-		if (type__name(ctype) != NULL)
+		if (type__name(ctype) != NULL && !expand_types)
 			printed += fprintf(fp, "enum %-*s %s", tconf.type_spacing - 5, type__name(ctype), name ?: "");
 		else
 			printed += enumeration__fprintf(type, &tconf, fp);
@@ -970,7 +1000,7 @@ static size_t class_member__fprintf(struct class_member *member, bool union_memb
 	    tag__is_enumeration(type)) {
 		printed += type__fprintf(type, cu, NULL, &sconf, fp);
 		if (name) {
-			if (!type__name(tag__type(type)))
+			if (!type__name(tag__type(type)) || sconf.expand_types)
 				printed += fprintf(fp, " ");
 			printed += fprintf(fp, "%s", name);
 		}
@@ -1376,6 +1406,9 @@ static size_t function__fprintf(const struct tag *tag, const struct cu *cu,
 	size_t printed = 0;
 	bool inlined = !conf->strip_inline && function__declared_inline(func);
 
+	if (tag->attribute)
+		printed += fprintf(fp, "%s ", tag->attribute);
+
 	if (func->virtuality == DW_VIRTUALITY_virtual ||
 	    func->virtuality == DW_VIRTUALITY_pure_virtual)
 		printed += fprintf(fp, "virtual ");
@@ -1462,19 +1495,93 @@ out:
 	return printed;
 }
 
+struct member_types_holes {
+	uint16_t nr_paddings;
+	uint16_t nr_with_bit_paddings;
+	uint16_t nr_with_holes;
+	uint16_t nr_with_bit_holes;
+	uint16_t total_nr_holes;
+	uint16_t total_nr_bit_holes;
+	uint32_t sum_paddings;
+	uint32_t sum_bit_paddings;
+};
+
+static size_t class__fprintf_member_type_holes(struct class *class, const struct cu *cu,
+					       struct member_types_holes *holes,
+					       uint8_t *newline, const struct conf_fprintf *conf, FILE *fp)
+{
+	size_t printed = 0;
+	uint16_t padding;
+	uint8_t nr_holes, nr_bit_holes, bit_padding;
+	bool first = true;
+	/*
+	 * We may not yet have looked for holes and paddings in this member's
+	 * struct type.
+	 */
+	class__find_holes(class);
+	class__infer_packed_attributes(class, cu);
+
+	padding = class->padding;
+	bit_padding = class->bit_padding;
+	nr_holes = class->nr_holes;
+	nr_bit_holes = class->nr_bit_holes;
+
+	if (!padding && !bit_padding && !nr_holes && !nr_bit_holes)
+		return 0;
+
+	if (!(*newline)++) {
+		fputc('\n', fp);
+		++printed;
+	}
+
+	printed += fprintf(fp, "\n%.*s/* XXX last struct has", conf->indent, tabs);
+
+	if (padding) {
+		++holes->nr_paddings;
+		holes->sum_paddings += padding;
+
+		printed += fprintf(fp, " %d byte%s of padding", padding, padding != 1 ? "s" : "");
+		first = false;
+	}
+
+	if (bit_padding) {
+		++holes->nr_with_bit_paddings;
+		holes->sum_bit_paddings += bit_padding;
+
+		printed += fprintf(fp, "%s %d bit%s of padding", first ? "" : ",",  bit_padding, bit_padding != 1 ? "s" : "");
+		first = false;
+	}
+
+	if (nr_holes) {
+		++holes->nr_with_holes;
+		holes->total_nr_holes += nr_holes;
+
+		printed += fprintf(fp, "%s %d hole%s", first ? "" : ",", nr_holes, nr_holes != 1 ? "s" : "");
+		first = false;
+	}
+
+	if (nr_bit_holes) {
+		++holes->nr_with_bit_holes;
+		holes->total_nr_bit_holes += nr_bit_holes;
+
+		printed += fprintf(fp, "%s %d bit hole%s", first ? "" : ",", nr_bit_holes, nr_bit_holes != 1 ? "s" : "");
+	}
+
+	return printed + fprintf(fp, " */");
+}
+
 static size_t __class__fprintf(struct class *class, const struct cu *cu,
 			       const struct conf_fprintf *conf, FILE *fp)
 {
 	struct type *type = &class->type;
 	size_t last_size = 0, size;
 	uint8_t newline = 0;
-	uint16_t nr_paddings = 0;
 	uint16_t nr_forced_alignments = 0, nr_forced_alignment_holes = 0;
 	uint32_t sum_forced_alignment_holes = 0;
 	uint32_t sum_bytes = 0, sum_bits = 0;
 	uint32_t sum_holes = 0;
-	uint32_t sum_paddings = 0;
 	uint32_t sum_bit_holes = 0;
+	struct member_types_holes member_types_holes = { 0, };
 	uint32_t cacheline = 0;
 	int size_diff = 0;
 	int first = 1;
@@ -1608,7 +1715,7 @@ static size_t __class__fprintf(struct class *class, const struct cu *cu,
 				if (pos_type == NULL) {
 					printed += fprintf(fp, "%.*s", cconf.indent, tabs);
 					printed += tag__id_not_found_fprintf(fp, pos->tag.type);
-					continue;
+					goto next_member;
 				}
 				/*
 				 * Now check if this isn't something like 'unsigned :N' with N > 0,
@@ -1645,7 +1752,6 @@ static size_t __class__fprintf(struct class *class, const struct cu *cu,
 			} else {
 				const ssize_t cc_last_size = ((ssize_t)pos->byte_offset -
 							      (ssize_t)last->byte_offset);
-
 				if (cc_last_size > 0 &&
 				   (size_t)cc_last_size < last_size) {
 					if (!cconf.suppress_comments) {
@@ -1671,41 +1777,26 @@ static size_t __class__fprintf(struct class *class, const struct cu *cu,
 		if (pos_type == NULL) {
 			printed += fprintf(fp, "%.*s", cconf.indent, tabs);
 			printed += tag__id_not_found_fprintf(fp, pos->tag.type);
-			continue;
+			goto next_member;
 		}
 
 		cconf.last_member = list_is_last(&tag_pos->node, &type->namespace.tags);
 		cconf.first_member = last == NULL;
 
 		size = pos->byte_size;
+		if (tag_pos->tag == DW_TAG_inheritance && pos->hole < 0) {
+			// Using the padding of an ancestor class
+			size += pos->hole;
+		}
+
 		printed += fprintf(fp, "%.*s", cconf.indent, tabs);
 		printed += struct_member__fprintf(pos, pos_type, cu, &cconf, fp);
 
 		if (tag__is_struct(pos_type) && !cconf.suppress_comments) {
 			struct class *tclass = tag__class(pos_type);
-			uint16_t padding;
-			/*
-			 * We may not yet have looked for holes and paddings
-			 * in this member's struct type.
-			 */
-			class__find_holes(tclass);
-			class__infer_packed_attributes(tclass, cu);
 
-			padding = tclass->padding;
-			if (padding > 0) {
-				++nr_paddings;
-				sum_paddings += padding;
-				if (!newline++) {
-					fputc('\n', fp);
-					++printed;
-				}
-
-				printed += fprintf(fp, "\n%.*s/* XXX last "
-						   "struct has %d byte%s of "
-						   "padding */", cconf.indent,
-						   tabs, padding,
-						   padding != 1 ? "s" : "");
-			}
+			printed += class__fprintf_member_type_holes(tclass, cu, &member_types_holes,
+								    &newline, &cconf, fp);
 		}
 
 		if (pos->bit_hole != 0 && !cconf.suppress_comments) {
@@ -1734,10 +1825,6 @@ static size_t __class__fprintf(struct class *class, const struct cu *cu,
 
 		fputc('\n', fp);
 		++printed;
-
-		/* XXX for now just skip these */
-		if (tag_pos->tag == DW_TAG_inheritance)
-			continue;
 #if 0
 		/*
  		 * This one was being skipped but caused problems with:
@@ -1745,13 +1832,13 @@ static size_t __class__fprintf(struct class *class, const struct cu *cu,
  		 * http://www.spinics.net/lists/dwarves/msg00119.html
  		 */
 		if (pos->virtuality == DW_VIRTUALITY_virtual)
-			continue;
+			goto next_member;
 #endif
 
 		if (pos->bitfield_size) {
 			sum_bits += pos->bitfield_size;
 		} else {
-			sum_bytes += pos->byte_size;
+			sum_bytes += size;
 		}
 
 		if (last == NULL || /* First member */
@@ -1782,7 +1869,7 @@ static size_t __class__fprintf(struct class *class, const struct cu *cu,
 			 */
 			last_size = size;
 		}
-
+next_member:
 		last = pos;
 	}
 
@@ -1841,11 +1928,36 @@ static size_t __class__fprintf(struct class *class, const struct cu *cu,
 		printed += fprintf(fp, "%.*s/* padding: %u */\n",
 				   cconf.indent,
 				   tabs, class->padding);
-	if (nr_paddings > 0)
+
+	if (member_types_holes.nr_with_holes > 0 ||
+	    member_types_holes.nr_with_bit_holes > 0 ||
+	    member_types_holes.nr_with_bit_paddings > 0) {
+		bool first = true;
+
+		printed += fprintf(fp, "%.*s/* member types with ", cconf.indent, tabs);
+		if (member_types_holes.nr_with_holes > 0) {
+			printed += fprintf(fp, "holes: %u, total: %u",
+					   member_types_holes.nr_with_holes, member_types_holes.total_nr_holes);
+			first = false;
+		}
+		if (member_types_holes.nr_with_bit_holes > 0) {
+			printed += fprintf(fp, "%sbit holes: %u, total: %u", first ? "" : ", ",
+					   member_types_holes.nr_with_bit_holes, member_types_holes.total_nr_bit_holes);
+			first = false;
+		}
+		if (member_types_holes.nr_with_bit_paddings > 0) {
+			printed += fprintf(fp, "%sbit paddings: %u, total: %u bit%s", first ? "" : ", ",
+					   member_types_holes.nr_with_bit_paddings,
+					   member_types_holes.sum_bit_paddings,
+					   member_types_holes.sum_bit_paddings > 1 ? "s" : "");
+		}
+		printed += fprintf(fp, " */\n");
+	}
+	if (member_types_holes.nr_paddings > 0)
 		printed += fprintf(fp, "%.*s/* paddings: %u, sum paddings: "
 				   "%u */\n",
 				   cconf.indent, tabs,
-				   nr_paddings, sum_paddings);
+				   member_types_holes.nr_paddings, member_types_holes.sum_paddings);
 	if (class->bit_padding > 0)
 		printed += fprintf(fp, "%.*s/* bit_padding: %u bits */\n",
 				   cconf.indent, tabs,
@@ -1964,7 +2076,7 @@ static size_t namespace__fprintf(const struct tag *tag, const struct cu *cu,
 		printed += fprintf(fp, "\n\n");
 	}
 
-	return printed + fprintf(fp, "}");
+	return fprintf(fp, "%.*s}", conf->indent, tabs);
 }
 
 size_t tag__fprintf(struct tag *tag, const struct cu *cu,
