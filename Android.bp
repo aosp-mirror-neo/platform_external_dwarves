@@ -53,7 +53,10 @@ cc_library_host_static {
     ],
     target: {
         musl: {
-            whole_static_libs: ["libobstack"],
+            whole_static_libs: [
+                "libobstack",
+                "libargp-musl",
+            ],
         },
     },
 }
