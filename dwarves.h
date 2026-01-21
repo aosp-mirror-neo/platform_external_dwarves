@@ -8,11 +8,13 @@
 */
 
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <obstack.h>
 #include <dwarf.h>
 #include <elfutils/libdwfl.h>
+#include <linux/types.h>
 #include <sys/types.h>
 
 #include "dutil.h"
@@ -41,13 +43,18 @@ enum load_steal_kind {
 	LSK__KEEPIT,
 	LSK__DELETE,
 	LSK__STOP_LOADING,
+	LSK__ABORT,
 };
 
-enum cu_state {
-	CU__UNPROCESSED,
-	CU__LOADED,
-	CU__PROCESSING,
-};
+/*
+ * Weak declarations of libbpf APIs that are version-dependent
+ */
+#define __weak __attribute__((weak))
+struct btf;
+__weak extern int btf__add_enum64(struct btf *btf, const char *name, __u32 byte_sz, bool is_signed);
+__weak extern int btf__add_enum64_value(struct btf *btf, const char *name, __u64 value);
+__weak extern int btf__add_type_attr(struct btf *btf, const char *value, int ref_type_id);
+__weak extern int btf__distill_base(const struct btf *src_btf, struct btf **new_base_btf, struct btf **new_split_btf);
 
 /*
  * BTF combines all the types into one big CU using btf_dedup(), so for something
@@ -55,11 +62,9 @@ enum cu_state {
  */
 typedef uint32_t type_id_t;
 
-struct btf;
 struct conf_fprintf;
 
 /** struct conf_load - load configuration
- * @thread_exit - called at the end of a thread, 1st user: BTF encoder dedup
  * @extra_dbg_info - keep original debugging format extra info
  *		     (e.g. DWARF's decl_{line,file}, id, etc)
  * @fixup_silly_bitfields - Fixup silly things such as "int foo:32;"
@@ -69,11 +74,8 @@ struct conf_fprintf;
  * @skip_missing - skip missing types rather than bailing out.
  */
 struct conf_load {
-	enum load_steal_kind	(*steal)(struct cu *cu,
-					 struct conf_load *conf,
-					 void *thr_data);
+	enum load_steal_kind	(*steal)(struct cu *cu, struct conf_load *conf);
 	struct cu *		(*early_cu_filter)(struct cu *cu);
-	int			(*thread_exit)(struct conf_load *conf, void *thr_data);
 	void			*cookie;
 	char			*format_path;
 	int			nr_jobs;
@@ -92,19 +94,19 @@ struct conf_load {
 	bool			btf_gen_optimized;
 	bool			skip_encoding_btf_inconsistent_proto;
 	bool			skip_encoding_btf_vars;
+	bool			encode_btf_global_vars;
 	bool			btf_gen_floats;
 	bool			btf_encode_force;
 	bool			reproducible_build;
 	bool			btf_decl_tag_kfuncs;
 	bool			btf_gen_distilled_base;
+	bool			btf_attributes;
 	uint8_t			hashtable_bits;
 	uint8_t			max_hashtable_bits;
 	uint16_t		kabi_prefix_len;
 	const char		*kabi_prefix;
 	struct btf		*base_btf;
 	struct conf_fprintf	*conf_fprintf;
-	int			(*threads_prepare)(struct conf_load *conf, int nr_threads, void **thr_data);
-	int			(*threads_collect)(struct conf_load *conf, int nr_threads, void **thr_data, int error);
 };
 
 /** struct conf_fprintf - hints to the __fprintf routines
@@ -185,10 +187,6 @@ void cus__add(struct cus *cus, struct cu *cu);
 
 void __cus__remove(struct cus *cus, struct cu *cu);
 void cus__remove(struct cus *cus, struct cu *cu);
-
-struct cu *cus__get_next_processable_cu(struct cus *cus);
-
-void cus__set_cu_state(struct cus *cus, struct cu *cu, enum cu_state state);
 
 void cus__print_error_msg(const char *progname, const struct cus *cus,
 			  const char *filename, const int err);
@@ -288,7 +286,8 @@ struct cu {
 	struct ptr_table functions_table;
 	struct ptr_table tags_table;
 	struct rb_root	 functions;
-	char		 *name;
+	uint32_t	 id;
+	const char	 *name;
 	char		 *filename;
 	void 		 *priv;
 	struct debug_fmt_ops *dfops;
@@ -305,7 +304,6 @@ struct cu {
 	uint8_t		 nr_register_params;
 	int		 register_params[ARCH_MAX_REGISTER_PARAMS];
 	int		 functions_saved;
-	enum cu_state	 state;
 	uint16_t	 language;
 	unsigned long	 nr_inline_expansions;
 	size_t		 size_inline_expansions;
@@ -350,6 +348,19 @@ static inline __pure bool cu__is_c(const struct cu *cu)
 }
 
 int lang__str2int(const char *lang);
+const char *lang__int2str(int lang);
+
+struct languages {
+	char *str;
+	int  *entries;
+	int  nr_entries;
+	bool exclude;
+};
+
+int languages__init(struct languages *languages, const char *tool);
+int languages__parse(struct languages *languages, const char *tool);
+bool languages__in(struct languages *languages, int lang);
+bool languages__cu_filtered(struct languages *languages, struct cu *cu, bool verbose);
 
 /**
  * cu__for_each_cached_symtab_entry - iterate thru the cached symtab entries
@@ -501,10 +512,16 @@ int cu__for_all_tags(struct cu *cu,
 				     struct cu *cu, void *cookie),
 		     void *cookie);
 
+struct attributes {
+	uint64_t cnt;
+	const char *values[];
+};
+
 /** struct tag - basic representation of a debug info element
  * @priv - extra data, for instance, DWARF offset, id, decl_{file,line}
  * @top_level -
  * @shared_tags: used by struct namespace
+ * @attributes - attributes specified by BTF_DECL_TAGs targeting this tag
  */
 struct tag {
 	struct list_head node;
@@ -515,7 +532,7 @@ struct tag {
 	bool		 has_btf_type_tag:1;
 	bool		 shared_tags:1;
 	uint8_t		 recursivity_level;
-	const char	 *attribute;
+	struct attributes *attributes;
 };
 
 // To use with things like type->type_enum == perf_event_type+perf_user_event_type
@@ -848,6 +865,8 @@ struct variable {
 	uint8_t		 external:1;
 	uint8_t		 declaration:1;
 	uint8_t		 has_specification:1;
+	uint8_t		 artificial:1;
+	uint8_t		 top_level:1;
 	enum vscope	 scope;
 	struct location	 location;
 	struct hlist_node tool_hnode;
@@ -1003,6 +1022,7 @@ struct ftype {
 	uint8_t		 unexpected_reg:1;
 	uint8_t		 processed:1;
 	uint8_t		 inconsistent_proto:1;
+	uint8_t		 uncertain_parm_loc:1;
 	struct list_head template_type_params;
 	struct list_head template_value_params;
 	struct template_parameter_pack *template_parameter_pack;
@@ -1408,6 +1428,10 @@ struct class {
 	uint8_t		 pre_bit_hole;
 	uint8_t		 bit_padding;
 	bool		 holes_searched;
+	bool		 flexible_array_verified;
+	bool		 embedded_flexible_array_searched;
+	bool		 has_flexible_array;
+	bool		 has_embedded_flexible_array;
 	bool		 is_packed;
 	void		 *priv;
 };
@@ -1450,6 +1474,8 @@ static inline int class__is_struct(const struct class *cls)
 	return tag__is_struct(&cls->type.namespace.tag);
 }
 
+bool class__has_embedded_flexible_array(struct class *cls, const struct cu *cu);
+bool class__has_flexible_array(struct class *class, const struct cu *cu);
 void class__find_holes(struct class *cls);
 int class__has_hole_ge(const struct class *cls, const uint16_t size);
 
@@ -1604,6 +1630,8 @@ void dwarves__exit(void);
 void dwarves__resolve_cacheline_size(const struct conf_load *conf, uint16_t user_cacheline_size);
 
 const char *dwarf_tag_name(const uint32_t tag);
+
+const char *vmlinux_path__btf_filename(void);
 
 const char *vmlinux_path__find_running_kernel(void);
 

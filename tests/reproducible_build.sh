@@ -4,19 +4,15 @@
 # Test if BTF generated serially matches reproducible parallel DWARF loading + serial BTF encoding
 # Arnaldo Carvalho de Melo <acme@redhat.com> (C) 2024-
 
-vmlinux=$1
+vmlinux=${vmlinux:-$1}
 
 if [ -z "$vmlinux" ] ; then
 	vmlinux=$(pahole --running_kernel_vmlinux)
-	if [ -z "$vmlinux" ] ; then
-		echo "Please specify a vmlinux file to operate on"
-		exit 1
-	fi
 fi
 
 if [ ! -f "$vmlinux" ] ; then
 	echo "$vmlinux file not available, please specify another"
-	exit 1
+	exit 2
 fi
 
 outdir=$(mktemp -d /tmp/reproducible_build.sh.XXXXXX)
@@ -24,6 +20,9 @@ outdir=$(mktemp -d /tmp/reproducible_build.sh.XXXXXX)
 echo -n "Parallel reproducible DWARF Loading/Serial BTF encoding: "
 
 test -n "$VERBOSE" && printf "\nserial encoding...\n"
+
+# This will make pahole and pfunct to skip rust CUs
+export PAHOLE_LANG_EXCLUDE=rust
 
 pahole --btf_features=default --btf_encode_detached=$outdir/vmlinux.btf.serial $vmlinux
 bpftool btf dump file $outdir/vmlinux.btf.serial > $outdir/bpftool.output.vmlinux.btf.serial
@@ -38,10 +37,7 @@ for threads in $(seq $nr_proc) ; do
 	sleep 0.3s
 	# PID part to remove ps output headers
 	nr_threads_started=$(ps -L -C pahole | grep -v PID | wc -l)
-
-	if [ $threads -gt 1 ] ; then
-		((nr_threads_started -= 1))
-	fi
+        ((nr_threads_started -= 1)) # main thread doesn't count, it waits to join
 
 	if [ $threads != $nr_threads_started ] ; then
 		echo "ERROR: pahole asked to start $threads encoding threads, started $nr_threads_started"
