@@ -86,18 +86,18 @@ static void __tag__print_not_supported(uint32_t tag, const char *func, unsigned 
 #define tag__print_not_supported(die) \
 	__tag__print_not_supported(dwarf_tag(die), __func__, dwarf_dieoffset(die))
 
-static void __cu__tag_not_handled(Dwarf_Die *die, const char *fn)
+static void __cu__tag_not_handled(const struct cu *cu, Dwarf_Die *die, const char *fn)
 {
 	uint32_t tag = dwarf_tag(die);
 
-	fprintf(stderr, "%s: DW_TAG_%s (%#x) @ <%#llx> not handled!\n",
+	fprintf(stderr, "%s: DW_TAG_%s (%#x) @ <%#llx> not handled in a %s CU!\n",
 		fn, dwarf_tag_name(tag), tag,
-		(unsigned long long)dwarf_dieoffset(die));
+		(unsigned long long)dwarf_dieoffset(die), lang__int2str(cu->language));
 }
 
 static struct tag unsupported_tag;
 
-#define cu__tag_not_handled(die) __cu__tag_not_handled(die, __FUNCTION__)
+#define cu__tag_not_handled(cu, die) __cu__tag_not_handled(cu, die, __FUNCTION__)
 
 struct dwarf_tag {
 	struct hlist_node hash_node;
@@ -450,7 +450,14 @@ static bool attr_type(Dwarf_Die *die, uint32_t attr_name, Dwarf_Off *offset)
 static int attr_location(Dwarf_Die *die, Dwarf_Op **expr, size_t *exprlen)
 {
 	Dwarf_Attribute attr;
+	int ret = 1;
+
 	if (dwarf_attr(die, DW_AT_location, &attr) != NULL) {
+		/* use libdw__lock as dwarf_getlocation(s) has concurrency
+		 * issues when libdw is not compiled with experimental
+		 * --enable-thread-safety
+		 */
+		pthread_mutex_lock(&libdw__lock);
 		if (dwarf_getlocation(&attr, expr, exprlen) == 0) {
 			/* DW_OP_addrx needs additional lookup for real addr. */
 			if (*exprlen != 0 && expr[0]->atom == DW_OP_addrx) {
@@ -462,11 +469,12 @@ static int attr_location(Dwarf_Die *die, Dwarf_Op **expr, size_t *exprlen)
 
 				expr[0]->number = address;
 			}
-			return 0;
+			ret = 0;
 		}
+		pthread_mutex_unlock(&libdw__lock);
 	}
 
-	return 1;
+	return ret;
 }
 
 /* The struct dwarf_tag has a fixed size while the 'struct tag' is just the base
@@ -505,7 +513,7 @@ static void tag__init(struct tag *tag, struct cu *cu, Dwarf_Die *die)
 
 	dwarf_tag__set_attr_type(dtag, abstract_origin, die, DW_AT_abstract_origin);
 	tag->recursivity_level = 0;
-	tag->attribute = NULL;
+	tag->attributes = NULL;
 
 	if (cu->extra_dbg_info) {
 		pthread_mutex_lock(&libdw__lock);
@@ -700,6 +708,11 @@ static enum vscope dwarf__location(Dwarf_Die *die, uint64_t *addr, struct locati
 		case DW_OP_addrx:
 			scope = VSCOPE_GLOBAL;
 			*addr = expr[0].number;
+
+			if (location->exprlen == 2 &&
+			    expr[1].atom == DW_OP_plus_uconst)
+				*addr += expr[1].number;
+
 			break;
 		case DW_OP_reg1 ... DW_OP_reg31:
 		case DW_OP_breg0 ... DW_OP_breg31:
@@ -730,7 +743,7 @@ const char *variable__scope_str(const struct variable *var)
 	return "unknown";
 }
 
-static struct variable *variable__new(Dwarf_Die *die, struct cu *cu, struct conf_load *conf)
+static struct variable *variable__new(Dwarf_Die *die, struct cu *cu, struct conf_load *conf, int top_level)
 {
 	bool has_specification = dwarf_hasattr(die, DW_AT_specification);
 	struct variable *var = tag__alloc(cu, sizeof(*var));
@@ -743,6 +756,8 @@ static struct variable *variable__new(Dwarf_Die *die, struct cu *cu, struct conf
 		/* non-defining declaration of an object */
 		var->declaration = dwarf_hasattr(die, DW_AT_declaration);
 		var->has_specification = has_specification;
+		var->artificial = dwarf_hasattr(die, DW_AT_artificial);
+		var->top_level = top_level;
 		var->scope = VSCOPE_UNKNOWN;
 		INIT_LIST_HEAD(&var->annots);
 		var->ip.addr = 0;
@@ -1121,7 +1136,7 @@ static int template_parameter_pack__load_params(struct template_parameter_pack *
 	die = &child;
 	do {
 		if (dwarf_tag(die) != DW_TAG_template_type_parameter) {
-			cu__tag_not_handled(die);
+			cu__tag_not_handled(cu, die);
 			continue;
 		}
 
@@ -1155,16 +1170,95 @@ static struct template_parameter_pack *template_parameter_pack__new(Dwarf_Die *d
 	return pack;
 }
 
+/* Returns number of locations found or negative value for errors. */
+static ptrdiff_t __dwarf_getlocations(Dwarf_Attribute *attr,
+				      ptrdiff_t offset, Dwarf_Addr *basep,
+				      Dwarf_Addr *startp, Dwarf_Addr *endp,
+				      Dwarf_Op **expr, size_t *exprlen)
+{
+	int ret;
+
+#if _ELFUTILS_PREREQ(0, 157)
+	ret = dwarf_getlocations(attr, offset, basep, startp, endp, expr, exprlen);
+#else
+	if (offset == 0) {
+		ret = dwarf_getlocation(attr, expr, exprlen);
+		if (ret == 0)
+			ret = 1;
+	}
+#endif
+	return ret;
+}
+
+/* For DW_AT_location 'attr':
+ * - if first location is DW_OP_regXX with expected number, return the register;
+ *   otherwise save the register for later return
+ * - if location DW_OP_entry_value(DW_OP_regXX) with expected number is in the
+ *   list, return the register; otherwise save register for later return
+ * - otherwise if no register was found for locations, return -1.
+ */
+static int parameter__reg(Dwarf_Attribute *attr, int expected_reg)
+{
+	Dwarf_Addr base, start, end;
+	Dwarf_Op *expr, *entry_ops;
+	Dwarf_Attribute entry_attr;
+	size_t exprlen, entry_len;
+	ptrdiff_t offset = 0;
+	int loc_num = -1;
+	int ret = -1;
+
+	/* use libdw__lock as dwarf_getlocation(s) has concurrency issues
+	 * when libdw is not compiled with experimental --enable-thread-safety
+	 */
+	pthread_mutex_lock(&libdw__lock);
+	while ((offset = __dwarf_getlocations(attr, offset, &base, &start, &end, &expr, &exprlen)) > 0) {
+		loc_num++;
+
+		/* Convert expression list (XX DW_OP_stack_value) -> (XX).
+		 * DW_OP_stack_value instructs interpreter to pop current value from
+		 * DWARF expression evaluation stack, and thus is not important here.
+		 */
+		if (exprlen > 1 && expr[exprlen - 1].atom == DW_OP_stack_value)
+			exprlen--;
+
+		if (exprlen != 1)
+			continue;
+
+		switch (expr->atom) {
+		/* match DW_OP_regXX at first location */
+		case DW_OP_reg0 ... DW_OP_reg31:
+			if (loc_num != 0)
+				break;
+			ret = expr->atom;
+			if (ret == expected_reg)
+				goto out;
+			break;
+		/* match DW_OP_entry_value(DW_OP_regXX) at any location */
+		case DW_OP_entry_value:
+		case DW_OP_GNU_entry_value:
+			if (dwarf_getlocation_attr(attr, expr, &entry_attr) == 0 &&
+			    dwarf_getlocation(&entry_attr, &entry_ops, &entry_len) == 0 &&
+			    entry_len == 1) {
+				ret = entry_ops->atom;
+				if (ret == expected_reg)
+					goto out;
+			}
+			break;
+		}
+	}
+out:
+	pthread_mutex_unlock(&libdw__lock);
+	return ret;
+}
+
 static struct parameter *parameter__new(Dwarf_Die *die, struct cu *cu,
 					struct conf_load *conf, int param_idx)
 {
 	struct parameter *parm = tag__alloc(cu, sizeof(*parm));
 
 	if (parm != NULL) {
-		Dwarf_Addr base, start, end;
 		bool has_const_value;
 		Dwarf_Attribute attr;
-		struct location loc;
 
 		tag__init(&parm->tag, cu, die);
 		parm->name = attr_string(die, DW_AT_name, conf);
@@ -1206,35 +1300,21 @@ static struct parameter *parameter__new(Dwarf_Die *die, struct cu *cu,
 		 */
 		has_const_value = dwarf_attr(die, DW_AT_const_value, &attr) != NULL;
 		parm->has_loc = dwarf_attr(die, DW_AT_location, &attr) != NULL;
-		/* dwarf_getlocations() handles location lists; here we are
-		 * only interested in the first expr.
-		 */
-		if (parm->has_loc &&
-#if _ELFUTILS_PREREQ(0, 157)
-		    dwarf_getlocations(&attr, 0, &base, &start, &end,
-				       &loc.expr, &loc.exprlen) > 0 &&
-#else
-		    dwarf_getlocation(&attr, &loc.expr, &loc.exprlen) == 0 &&
-#endif
-			loc.exprlen != 0) {
-			int expected_reg = cu->register_params[param_idx];
-			Dwarf_Op *expr = loc.expr;
 
-			switch (expr->atom) {
-			case DW_OP_reg0 ... DW_OP_reg31:
+		if (parm->has_loc) {
+			int expected_reg = cu->register_params[param_idx];
+			int actual_reg = parameter__reg(&attr, expected_reg);
+
+			if (actual_reg < 0)
+				parm->optimized = 1;
+			else if (expected_reg >= 0 && expected_reg != actual_reg)
 				/* mark parameters that use an unexpected
 				 * register to hold a parameter; these will
 				 * be problematic for users of BTF as they
 				 * violate expectations about register
 				 * contents.
 				 */
-				if (expected_reg >= 0 && expected_reg != expr->atom)
-					parm->unexpected_reg = 1;
-				break;
-			default:
-				parm->optimized = 1;
-				break;
-			}
+				parm->unexpected_reg = 1;
 		} else if (has_const_value) {
 			parm->optimized = 1;
 		}
@@ -1253,7 +1333,7 @@ static int formal_parameter_pack__load_params(struct formal_parameter_pack *pack
 	die = &child;
 	do {
 		if (dwarf_tag(die) != DW_TAG_formal_parameter) {
-			cu__tag_not_handled(die);
+			cu__tag_not_handled(cu, die);
 			continue;
 		}
 
@@ -1692,7 +1772,7 @@ static struct tag *die__create_new_array(Dwarf_Die *die, struct cu *cu)
 				break;
 			}
 		} else
-			cu__tag_not_handled(die);
+			cu__tag_not_handled(cu, die);
 	} while (dwarf_siblingof(die, die) == 0);
 
 	array->nr_entries = memdup(nr_entries,
@@ -1767,9 +1847,9 @@ static struct tag *die__create_new_label(Dwarf_Die *die,
 	return &label->ip.tag;
 }
 
-static struct tag *die__create_new_variable(Dwarf_Die *die, struct cu *cu, struct conf_load *conf)
+static struct tag *die__create_new_variable(Dwarf_Die *die, struct cu *cu, struct conf_load *conf, int top_level)
 {
-	struct variable *var = variable__new(die, cu, conf);
+	struct variable *var = variable__new(die, cu, conf, top_level);
 
 	if (var == NULL || add_child_llvm_annotations(die, -1, conf, &var->annots))
 		return NULL;
@@ -1873,7 +1953,7 @@ static struct tag *die__create_new_enumeration(Dwarf_Die *die, struct cu *cu, st
 		struct enumerator *enumerator;
 
 		if (dwarf_tag(die) != DW_TAG_enumerator) {
-			cu__tag_not_handled(die);
+			cu__tag_not_handled(cu, die);
 			continue;
 		}
 		enumerator = enumerator__new(die, cu, conf);
@@ -2102,7 +2182,7 @@ static int die__process_inline_expansion(Dwarf_Die *die, struct lexblock *lexblo
 			 * DW_TAG_function... Lets just get the types
 			 * for 1.8, then fix this properly.
 			 *
-			 * cu__tag_not_handled(die);
+			 * cu__tag_not_handled(cu, die);
 			 */
 			continue;
 		case DW_TAG_inlined_subroutine:
@@ -2243,7 +2323,7 @@ static int die__process_function(Dwarf_Die *die, struct ftype *ftype,
 			tag = die__create_new_parameter(die, ftype, lexblock, cu, conf, param_idx++);
 			break;
 		case DW_TAG_variable:
-			tag = die__create_new_variable(die, cu, conf);
+			tag = die__create_new_variable(die, cu, conf, 0);
 			if (tag == NULL)
 				goto out_enomem;
 			lexblock__add_variable(lexblock, tag__variable(tag));
@@ -2367,11 +2447,11 @@ static struct tag *__die__process_tag(Dwarf_Die *die, struct cu *cu,
 	case DW_TAG_union_type:
 		tag = die__create_new_union(die, cu, conf);	break;
 	case DW_TAG_variable:
-		tag = die__create_new_variable(die, cu, conf);	break;
+		tag = die__create_new_variable(die, cu, conf, top_level);	break;
 	case DW_TAG_constant: // First seen in a Go CU
 		tag = die__create_new_constant(die, cu, conf);	break;
 	default:
-		__cu__tag_not_handled(die, fn);
+		__cu__tag_not_handled(cu, die, fn);
 		/* fall thru */
 	case DW_TAG_dwarf_procedure:
 		/*
@@ -3175,24 +3255,20 @@ static void cu__sort_types_by_offset(struct cu *cu, struct conf_load *conf)
 	cu__for_all_tags(cu, type__sort_by_offset, conf);
 }
 
-static int cu__finalize(struct cu *cu, struct cus *cus, struct conf_load *conf, void *thr_data)
+static void cu__finalize(struct cu *cu, struct cus *cus, struct conf_load *conf)
 {
 	cu__for_all_tags(cu, class_member__cache_byte_size, conf);
 
 	if (cu__language_reorders_offsets(cu))
 		cu__sort_types_by_offset(cu, conf);
-
-	cus__set_cu_state(cus, cu, CU__LOADED);
-
-	if (conf && conf->steal) {
-		return conf->steal(cu, conf, thr_data);
-	}
-	return LSK__KEEPIT;
 }
 
-static int cus__finalize(struct cus *cus, struct cu *cu, struct conf_load *conf, void *thr_data)
+static int cus__steal_now(struct cus *cus, struct cu *cu, struct conf_load *conf)
 {
-	int lsk = cu__finalize(cu, cus, conf, thr_data);
+	if (!conf || !conf->steal)
+		return 0;
+
+	int lsk = conf->steal(cu, conf);
 	switch (lsk) {
 	case LSK__DELETE:
 		cus__remove(cus, cu);
@@ -3201,6 +3277,8 @@ static int cus__finalize(struct cus *cus, struct cu *cu, struct conf_load *conf,
 	case LSK__STOP_LOADING:
 		break;
 	case LSK__KEEPIT:
+		break;
+	case LSK__ABORT:
 		break;
 	}
 	return lsk;
@@ -3247,11 +3325,14 @@ static int __cus__load_debug_types(struct cus *cus, struct conf_load *conf, Dwfl
 				     build_id_len, filename, conf->use_obstack);
 			if (cu == NULL ||
 			    cu__set_common(cu, conf, mod, elf) != 0) {
+				cu__delete(cu);
 				return DWARF_CB_ABORT;
 			}
 
-			if (dwarf_cu__init(dcup, cu) != 0)
+			if (dwarf_cu__init(dcup, cu) != 0) {
+				cu__delete(cu);
 				return DWARF_CB_ABORT;
+			}
 			dcup->cu = cu;
 			/* Funny hack.  */
 			dcup->type_unit = dcup;
@@ -3361,13 +3442,119 @@ struct dwarf_cus {
 	const unsigned char *build_id;
 	int		    build_id_len;
 	int		    error;
+	int		    lsk_status;
 	struct dwarf_cu	    *type_dcu;
+	uint32_t	nr_cus_created;
 };
 
-struct dwarf_thread {
-	struct dwarf_cus	*dcus;
-	void			*data;
+/* Multithreading is implemented using a job/worker model.
+ * cus_processing_queue represents a collection of jobs to be
+ * completed by workers.
+ * dwarf_loader__worker_thread is the worker loop, taking jobs from
+ * the queue, executing them and re-enqueuing new jobs as necessary.
+ * Implementation of this queue ensures two constraints:
+ *   * JOB_STEAL jobs for a CU are executed in the order of cu->id, as
+ *     a consequence JOB_STEAL jobs always run one at a time.
+ *   * Initial number of JOB_DECODE jobs in the queue is effectively a
+ *     limit on how many decoded CUs can be held in memory.
+ *     See dwarf_loader__decoded_cus_limit()
+ */
+static struct {
+	pthread_mutex_t mutex;
+	pthread_cond_t job_added;
+	/* next_cu_id determines the next CU ready to be stealed
+	 * This enforces the order of CU stealing.
+	 */
+	uint32_t next_cu_id;
+	struct list_head jobs;
+	bool abort;
+} cus_processing_queue;
+
+enum job_type {
+	JOB_NONE = 0,
+	JOB_DECODE = 1,
+	JOB_STEAL = 2,
 };
+
+struct cu_processing_job {
+	struct list_head node;
+	enum job_type type;
+	struct cu *cu; /* for JOB_STEAL */
+};
+
+static void cus_queue__init(void)
+{
+	pthread_mutex_init(&cus_processing_queue.mutex, NULL);
+	pthread_cond_init(&cus_processing_queue.job_added, NULL);
+	INIT_LIST_HEAD(&cus_processing_queue.jobs);
+	cus_processing_queue.next_cu_id = 0;
+	cus_processing_queue.abort = false;
+}
+
+static void cus_queue__destroy(void)
+{
+	pthread_mutex_destroy(&cus_processing_queue.mutex);
+	pthread_cond_destroy(&cus_processing_queue.job_added);
+}
+
+static inline void cus_queue__inc_next_cu_id(void)
+{
+	pthread_mutex_lock(&cus_processing_queue.mutex);
+	cus_processing_queue.next_cu_id++;
+	pthread_mutex_unlock(&cus_processing_queue.mutex);
+}
+
+static struct cu_processing_job *cus_queue__try_dequeue(void)
+{
+	struct cu_processing_job *job, *dequeued_job = NULL;
+	struct list_head *pos, *tmp;
+
+	list_for_each_safe(pos, tmp, &cus_processing_queue.jobs) {
+		job = list_entry(pos, struct cu_processing_job, node);
+		if (job->type == JOB_STEAL && job->cu->id == cus_processing_queue.next_cu_id) {
+			dequeued_job = job;
+			break;
+		}
+		if (job->type == JOB_DECODE) {
+			/* all JOB_STEALs are added to the head, so no viable JOB_STEAL available */
+			dequeued_job = job;
+			break;
+		}
+	}
+
+	/* No jobs or only steals out of order */
+	if (!dequeued_job)
+		return NULL;
+
+	list_del(&dequeued_job->node);
+
+	return dequeued_job;
+}
+
+static struct cu_processing_job *cus_queue__enqdeq_job(struct cu_processing_job *job)
+{
+	pthread_mutex_lock(&cus_processing_queue.mutex);
+	if (job) {
+		/* JOB_STEAL have higher priority, add them to the head so
+		 * they can be found faster
+		 */
+		if (job->type == JOB_STEAL)
+			list_add(&job->node, &cus_processing_queue.jobs);
+		else
+			list_add_tail(&job->node, &cus_processing_queue.jobs);
+		pthread_cond_signal(&cus_processing_queue.job_added);
+	}
+	for (;;) {
+		bool abort = __atomic_load_n(&cus_processing_queue.abort, __ATOMIC_SEQ_CST);
+		job = cus_queue__try_dequeue();
+		if (job || abort)
+			break;
+		/* No jobs or only steals out of order */
+		pthread_cond_wait(&cus_processing_queue.job_added, &cus_processing_queue.mutex);
+	}
+	pthread_mutex_unlock(&cus_processing_queue.mutex);
+	return job;
+}
 
 static struct dwarf_cu *dwarf_cus__create_cu(struct dwarf_cus *dcus, Dwarf_Die *cu_die, uint8_t pointer_size)
 {
@@ -3378,8 +3565,10 @@ static struct dwarf_cu *dwarf_cus__create_cu(struct dwarf_cus *dcus, Dwarf_Die *
 	 */
 	const char *name = attr_string(cu_die, DW_AT_name, dcus->conf);
 	struct cu *cu = cu__new(name ?: "", pointer_size, dcus->build_id, dcus->build_id_len, dcus->filename, dcus->conf->use_obstack);
-	if (cu == NULL || cu__set_common(cu, dcus->conf, dcus->mod, dcus->elf) != 0)
+	if (cu == NULL || cu__set_common(cu, dcus->conf, dcus->mod, dcus->elf) != 0) {
+		cu__delete(cu);
 		return NULL;
+	}
 
 	struct dwarf_cu *dcu = dwarf_cu__new(cu);
 
@@ -3392,29 +3581,10 @@ static struct dwarf_cu *dwarf_cus__create_cu(struct dwarf_cus *dcus, Dwarf_Die *
 	cu->priv = dcu;
 	cu->dfops = &dwarf__ops;
 
+	cu->id = dcus->nr_cus_created;
+	dcus->nr_cus_created++;
+
 	return dcu;
-}
-
-static int dwarf_cus__process_cu(struct dwarf_cus *dcus, Dwarf_Die *cu_die,
-				 struct cu *cu, void *thr_data)
-{
-	if (die__process_and_recode(cu_die, cu, dcus->conf) != 0 ||
-	    cus__finalize(dcus->cus, cu, dcus->conf, thr_data) == LSK__STOP_LOADING)
-		return DWARF_CB_ABORT;
-
-       return DWARF_CB_OK;
-}
-
-static int dwarf_cus__create_and_process_cu(struct dwarf_cus *dcus, Dwarf_Die *cu_die, uint8_t pointer_size)
-{
-	struct dwarf_cu *dcu = dwarf_cus__create_cu(dcus, cu_die, pointer_size);
-
-	if (dcu == NULL)
-		return DWARF_CB_ABORT;
-
-	cus__add(dcus->cus, dcu->cu);
-
-	return dwarf_cus__process_cu(dcus, cu_die, dcu->cu, NULL);
 }
 
 static int dwarf_cus__nextcu(struct dwarf_cus *dcus, struct dwarf_cu **dcu,
@@ -3457,54 +3627,148 @@ out_unlock:
 	return ret;
 }
 
-static void *dwarf_cus__process_cu_thread(void *arg)
+static struct cu *dwarf_loader__decode_next_cu(struct dwarf_cus *dcus)
 {
-	struct dwarf_thread *dthr = arg;
-	struct dwarf_cus *dcus = dthr->dcus;
 	uint8_t pointer_size, offset_size;
+	struct dwarf_cu *dcu = NULL;
 	Dwarf_Die die_mem, *cu_die;
-	struct dwarf_cu *dcu;
+	int err;
 
-	while (dwarf_cus__nextcu(dcus, &dcu, &die_mem, &cu_die, &pointer_size, &offset_size) == 0) {
-		if (cu_die == NULL)
+	err = dwarf_cus__nextcu(dcus, &dcu, &die_mem, &cu_die, &pointer_size, &offset_size);
+
+	if (err < 0)
+		goto out_error;
+	else if (err == 1) /* no more CUs */
+		return NULL;
+
+	err = die__process_and_recode(cu_die, dcu->cu, dcus->conf);
+	if (err)
+		goto out_error;
+
+	cu__finalize(dcu->cu, dcus->cus, dcus->conf);
+
+	return dcu->cu;
+
+out_error:
+	dcus->error = err;
+	fprintf(stderr, "error decoding cu %s\n", dcu && dcu->cu ? dcu->cu->name : "");
+	return NULL;
+}
+
+static void *dwarf_loader__worker_thread(void *arg)
+{
+	struct cu_processing_job *job = NULL;
+	struct dwarf_cus *dcus = arg;
+	bool stop = false;
+	struct cu *cu;
+	int ret;
+
+	while (!stop) {
+		job = cus_queue__enqdeq_job(job);
+		if (!job)
+			goto out_early;
+
+		switch (job->type) {
+
+		case JOB_DECODE:
+			cu = dwarf_loader__decode_next_cu(dcus);
+
+			if (cu == NULL) {
+				free(job);
+				stop = true;
+				break;
+			}
+
+			job->type = JOB_STEAL;
+			job->cu = cu;
 			break;
 
-		if (dwarf_cus__process_cu(dcus, cu_die, dcu->cu, dthr->data) == DWARF_CB_ABORT)
-			goto out_abort;
+		case JOB_STEAL:
+			ret = cus__steal_now(dcus->cus, job->cu, dcus->conf);
+			if (ret == LSK__ABORT || ret == LSK__STOP_LOADING) {
+				dcus->lsk_status = ret;
+				goto out_early;
+			}
+			cus_queue__inc_next_cu_id();
+			/* re-enqueue JOB_DECODE so that next CU is decoded from DWARF */
+			job->type = JOB_DECODE;
+			job->cu = NULL;
+			break;
+
+		default:
+			fprintf(stderr, "Unknown dwarf_loader job type %d\n", job->type);
+			goto out_early;
+		}
 	}
 
-	if (dcus->conf->thread_exit &&
-	    dcus->conf->thread_exit(dcus->conf, dthr->data) != 0)
-		goto out_abort;
+	if (dcus->error)
+		goto out_early;
 
 	return (void *)DWARF_CB_OK;
-out_abort:
+out_early:
+	__atomic_store_n(&cus_processing_queue.abort, true, __ATOMIC_SEQ_CST);
+	pthread_cond_signal(&cus_processing_queue.job_added);
 	return (void *)DWARF_CB_ABORT;
 }
 
-static int dwarf_cus__threaded_process_cus(struct dwarf_cus *dcus)
+/*
+ * If workers pick up next cu for decoding as soon as they're ready,
+ * then the memory usage may greatly increase, if the stealer can't
+ * keep up with incoming work.
+ * If we want to avoid this there needs to be a limit on how many
+ * decoded, but not yet stolen, CUs we allow to hold in memory. When
+ * this limit is reached the workers will wait for more CUs to get
+ * stolen.
+ * The limit is enforced by the number of JOB_DECODE jobs we enqueue
+ * before the workers have started decoding.  A job serves as a
+ * "ticket": worker can proceed with decoding only if it has a ticket.
+ *
+ * As for the value of this limit, it must be at least N, where N is
+ * the number of workers.  If the limit < N, some workers will never
+ * work. Setting the limit higher, while allows for higher memory
+ * consumption, does not necessarily improves the total pahole
+ * runtime, likely due to increased concurrent memory allocation.
+ *
+ * Here are some data points that led to the chosen value:
+ *
+ * perf stat -e cpu-clock -r13 ... pahole -J -j$(nproc) ... vmlinux
+ *   limit=N       1.58878 +- 0.00859 seconds time elapsed  ( +-  0.54% )
+ *   limit=Nx2     1.58532 +- 0.00405 seconds time elapsed  ( +-  0.26% )  # best
+ *   limit=Nx4     1.59415 +- 0.00413 seconds time elapsed  ( +-  0.26% )
+ *   limit=Nx8     1.62584 +- 0.00448 seconds time elapsed  ( +-  0.28% )
+ *   limit=Nx1024  1.92333 +- 0.00765 seconds time elapsed  ( +-  0.40% )
+ */
+static inline int dwarf_loader__decoded_cus_limit(const struct conf_load *conf)
 {
-	pthread_t threads[dcus->conf->nr_jobs];
-	struct dwarf_thread dthr[dcus->conf->nr_jobs];
-	void *thread_data[dcus->conf->nr_jobs];
-	int res;
+	return conf->nr_jobs > 0 ? conf->nr_jobs * 2 : 2;
+}
+
+static int dwarf_cus__process_cus(struct dwarf_cus *dcus)
+{
+	int nr_workers = dcus->conf->nr_jobs > 0 ? dcus->conf->nr_jobs : 1;
+	pthread_t workers[nr_workers];
+	struct cu_processing_job *job;
 	int i;
 
-	if (dcus->conf->threads_prepare) {
-		res = dcus->conf->threads_prepare(dcus->conf, dcus->conf->nr_jobs, thread_data);
-		if (res != 0)
-			return res;
-	} else {
-		memset(thread_data, 0, sizeof(void *) * dcus->conf->nr_jobs);
+	cus_queue__init();
+
+	/* Fill up the queue with JOB_DECODE jobs.
+	 */
+	for (i = 0; i < dwarf_loader__decoded_cus_limit(dcus->conf); i++) {
+		job = calloc(1, sizeof(*job));
+		if (!job) {
+			dcus->error = -ENOMEM;
+			goto out_early;
+		}
+		job->type = JOB_DECODE;
+		/* no need for locks, workers were not started yet */
+		list_add(&job->node, &cus_processing_queue.jobs);
 	}
 
-	for (i = 0; i < dcus->conf->nr_jobs; ++i) {
-		dthr[i].dcus = dcus;
-		dthr[i].data = thread_data[i];
-
-		dcus->error = pthread_create(&threads[i], NULL,
-					     dwarf_cus__process_cu_thread,
-					     &dthr[i]);
+	for (i = 0; i < nr_workers; ++i) {
+		dcus->error = pthread_create(&workers[i], NULL,
+					     dwarf_loader__worker_thread,
+					     dcus);
 		if (dcus->error)
 			goto out_join;
 	}
@@ -3514,50 +3778,16 @@ static int dwarf_cus__threaded_process_cus(struct dwarf_cus *dcus)
 out_join:
 	while (--i >= 0) {
 		void *res;
-		int err = pthread_join(threads[i], &res);
+		int err = pthread_join(workers[i], &res);
 
 		if (err == 0 && res != NULL)
 			dcus->error = (long)res;
 	}
 
-	if (dcus->conf->threads_collect) {
-		res = dcus->conf->threads_collect(dcus->conf, dcus->conf->nr_jobs,
-						  thread_data, dcus->error);
-		if (dcus->error == 0)
-			dcus->error = res;
-	}
+out_early:
+	cus_queue__destroy();
 
 	return dcus->error;
-}
-
-static int __dwarf_cus__process_cus(struct dwarf_cus *dcus)
-{
-	uint8_t pointer_size, offset_size;
-	Dwarf_Off noff;
-	size_t cuhl;
-
-	while (dwarf_nextcu(dcus->dw, dcus->off, &noff, &cuhl, NULL, &pointer_size, &offset_size) == 0) {
-		Dwarf_Die die_mem;
-		Dwarf_Die *cu_die = dwarf_offdie(dcus->dw, dcus->off + cuhl, &die_mem);
-
-		if (cu_die == NULL)
-			break;
-
-		if (dwarf_cus__create_and_process_cu(dcus, cu_die, pointer_size) == DWARF_CB_ABORT)
-			return DWARF_CB_ABORT;
-
-		dcus->off = noff;
-	}
-
-	return 0;
-}
-
-static int dwarf_cus__process_cus(struct dwarf_cus *dcus)
-{
-	if (dcus->conf->nr_jobs > 1)
-		return dwarf_cus__threaded_process_cus(dcus);
-
-	return __dwarf_cus__process_cus(dcus);
 }
 
 static int cus__merge_and_process_cu(struct cus *cus, struct conf_load *conf,
@@ -3615,7 +3845,18 @@ static int cus__merge_and_process_cu(struct cus *cus, struct conf_load *conf,
 
 		Dwarf_Die child;
 		if (dwarf_child(cu_die, &child) == 0) {
-			if (die__process_unit(&child, cu, conf) != 0)
+			bool filtered = false;
+
+			if (conf->early_cu_filter) {
+				struct cu unmerged_cu = {
+					.name	  = attr_string(cu_die, DW_AT_name, conf),
+					.language = attr_numeric(cu_die, DW_AT_language),
+				};
+
+				filtered = conf->early_cu_filter(&unmerged_cu) == NULL;
+			}
+
+			if (!filtered && die__process_unit(&child, cu, conf) != 0)
 				goto out_abort;
 		}
 
@@ -3638,7 +3879,8 @@ static int cus__merge_and_process_cu(struct cus *cus, struct conf_load *conf,
 	if (cu__resolve_func_ret_types_optimized(cu) != LSK__KEEPIT)
 		goto out_abort;
 
-	if (cus__finalize(cus, cu, conf, NULL) == LSK__STOP_LOADING)
+	cu__finalize(cu, cus, conf);
+	if (cus__steal_now(cus, cu, conf) == LSK__ABORT)
 		goto out_abort;
 
 	return 0;
@@ -3663,6 +3905,7 @@ static int cus__load_module(struct cus *cus, struct conf_load *conf,
 	struct cu *type_cu;
 	struct dwarf_cu type_dcu;
 	int type_lsk = LSK__KEEPIT;
+	int lsk_worker_status = LSK__ABORT;
 
 	int res = __cus__load_debug_types(cus, conf, mod, dw, elf, filename, build_id, build_id_len, &type_cu, &type_dcu);
 	if (res != 0) {
@@ -3670,7 +3913,8 @@ static int cus__load_module(struct cus *cus, struct conf_load *conf,
 	}
 
 	if (type_cu != NULL) {
-		type_lsk = cu__finalize(type_cu, cus, conf, NULL);
+		cu__finalize(type_cu, cus, conf);
+		type_lsk = cus__steal_now(cus, type_cu, conf);
 		if (type_lsk == LSK__DELETE) {
 			cus__remove(cus, type_cu);
 		}
@@ -3692,11 +3936,13 @@ static int cus__load_module(struct cus *cus, struct conf_load *conf,
 			.type_dcu = type_cu ? &type_dcu : NULL,
 			.build_id = build_id,
 			.build_id_len = build_id_len,
+			.nr_cus_created = 0,
 		};
 		res = dwarf_cus__process_cus(&dcus);
+		lsk_worker_status = dcus.lsk_status;
 	}
 
-	if (res)
+	if (res && lsk_worker_status == LSK__ABORT)
 		return res;
 
 	if (type_lsk == LSK__DELETE)
@@ -3804,7 +4050,7 @@ static int cus__process_file(struct cus *cus, struct conf_load *conf, int fd,
 
 	/* Process the one or more modules gleaned from this file. */
 	int err = dwfl_getmodules(dwfl, cus__process_dwflmod, &parms, 0);
-	if (err < 0)
+	if (err)
 		return -1;
 
 	// We can't call dwfl_end(dwfl) here, as we keep pointers to strings
