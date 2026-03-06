@@ -777,6 +777,9 @@ struct cu *cu__new(const char *name, uint8_t addr_size,
 		if (cu->use_obstack)
 			obstack_init(&cu->obstack);
 
+		if (name == NULL || filename == NULL)
+			goto out_free;
+
 		cu->name = strdup(name);
 		if (cu->name == NULL)
 			goto out_free;
@@ -1575,6 +1578,39 @@ void lexblock__add_label(struct lexblock *block, struct label *label)
 	lexblock__add_tag(block, &label->ip.tag);
 }
 
+static bool __class__has_flexible_array(struct class *class, const struct cu *cu)
+{
+	struct class_member *member = type__last_member(&class->type);
+
+	if (member == NULL)
+		return false;
+
+	struct tag *type = cu__type(cu, member->tag.type);
+
+	if (type->tag != DW_TAG_array_type)
+		return false;
+
+	struct array_type *array = tag__array_type(type);
+
+	if (array->dimensions > 1)
+		return false;
+
+	if (array->nr_entries == NULL || array->nr_entries[0] == 0)
+		return true;
+
+	return false;
+}
+
+bool class__has_flexible_array(struct class *class, const struct cu *cu)
+{
+	if (!class->flexible_array_verified) {
+		class->has_flexible_array = __class__has_flexible_array(class, cu);
+		class->flexible_array_verified = true;
+	}
+
+	return class->has_flexible_array;
+}
+
 const struct class_member *class__find_bit_hole(const struct class *class,
 					    const struct class_member *trailer,
 						const uint16_t bit_hole_size)
@@ -1702,6 +1738,50 @@ void class__find_holes(struct class *class)
 	class->padding = ctype->size - last_seen_bit / 8;
 
 	class->holes_searched = true;
+}
+
+bool class__has_embedded_flexible_array(struct class *cls, const struct cu *cu)
+{
+	struct type *ctype = &cls->type;
+	struct class_member *pos;
+
+	if (!tag__is_struct(class__tag(cls)))
+		return false;
+
+	if (cls->embedded_flexible_array_searched)
+		return cls->has_embedded_flexible_array;
+
+	type__for_each_member(ctype, pos) {
+		/* XXX for now just skip these */
+		if (pos->tag.tag == DW_TAG_inheritance &&
+		    pos->virtuality == DW_VIRTUALITY_virtual)
+			continue;
+
+		if (pos->is_static)
+			continue;
+
+		struct tag *member_type = tag__strip_typedefs_and_modifiers(&pos->tag, cu);
+		if (member_type == NULL)
+			continue;
+
+		if (!tag__is_struct(member_type))
+			continue;
+
+		cls->has_embedded_flexible_array = class__has_flexible_array(tag__class(member_type), cu);
+		if (cls->has_embedded_flexible_array)
+			break;
+
+		if (member_type == class__tag(cls))
+			continue;
+
+		cls->has_embedded_flexible_array = class__has_embedded_flexible_array(tag__class(member_type), cu);
+		if (cls->has_embedded_flexible_array)
+			break;
+	}
+
+	cls->embedded_flexible_array_searched = true;
+
+	return cls->has_embedded_flexible_array;
 }
 
 static size_t type__natural_alignment(struct type *type, const struct cu *cu);
@@ -2364,9 +2444,7 @@ int cus__load_file(struct cus *cus, struct conf_load *conf,
 #define DW_LANG_BLISS		0x0025
 #endif
 
-int lang__str2int(const char *lang)
-{
-	static const char *languages[] = {
+static const char *languages[] = {
 	[DW_LANG_Ada83]		 = "ada83",
 	[DW_LANG_Ada95]		 = "ada95",
 	[DW_LANG_BLISS]		 = "bliss",
@@ -2404,8 +2482,22 @@ int lang__str2int(const char *lang)
 	[DW_LANG_Rust]		 = "rust",
 	[DW_LANG_Swift]		 = "swift",
 	[DW_LANG_UPC]		 = "upc",
-	};
+};
 
+const char *lang__int2str(int id)
+{
+	const char *lang = NULL;
+
+	if (id < ARRAY_SIZE(languages))
+		lang = languages[id];
+	else if (id == DW_LANG_Mips_Assembler)
+		return "asm";
+
+	return lang ?: "UNKNOWN";
+}
+
+int lang__str2int(const char *lang)
+{
 	if (strcasecmp(lang, "asm") == 0)
 		return DW_LANG_Mips_Assembler;
 
@@ -2417,6 +2509,102 @@ int lang__str2int(const char *lang)
 	return -1;
 }
 
+static int lang_id_cmp(const void *pa, const void *pb)
+{
+	int a = *(int *)pa,
+	    b = *(int *)pb;
+	return a - b;
+}
+
+int languages__parse(struct languages *languages, const char *tool)
+{
+	int nr_allocated = 4;
+	char *lang = languages->str;
+
+	languages->entries = zalloc(sizeof(int) * nr_allocated);
+	if (languages->entries == NULL)
+		goto out_enomem;
+
+	while (1) {
+		char *sep = strchr(lang, ',');
+
+		if (sep)
+			*sep = '\0';
+
+		int id = lang__str2int(lang);
+
+		if (sep)
+			*sep = ',';
+
+		if (id < 0) {
+			fprintf(stderr, "%s: unknown language \"%s\"\n", tool, lang);
+			goto out_free;
+		}
+
+		if (languages->nr_entries >= nr_allocated) {
+			nr_allocated *= 2;
+			int *entries = realloc(languages->entries, nr_allocated);
+
+			if (entries == NULL)
+				goto out_enomem;
+
+			languages->entries = entries;
+		}
+
+		languages->entries[languages->nr_entries++] = id;
+
+		if (!sep)
+			break;
+
+		lang = sep + 1;
+	}
+
+	qsort(languages->entries, languages->nr_entries, sizeof(int), lang_id_cmp);
+
+	return 0;
+out_enomem:
+	fprintf(stderr, "%s: not enough memory to parse --lang\n", tool);
+out_free:
+	zfree(&languages->entries);
+	languages->nr_entries = 0;
+	return -1;
+}
+
+bool languages__in(struct languages *languages, int lang)
+{
+	return bsearch(&lang, languages->entries, languages->nr_entries, sizeof(int), lang_id_cmp) != NULL;
+}
+
+int languages__init(struct languages *languages, const char *tool)
+{
+	if (languages->str == NULL) { // use PAHOLE_ as the namespace for all these tools
+		languages->str = getenv("PAHOLE_LANG_EXCLUDE");
+
+		if (languages->str == NULL)
+			return 0;
+
+		languages->exclude = true;
+	}
+
+	return languages__parse(languages, tool);
+}
+
+bool languages__cu_filtered(struct languages *languages, struct cu *cu, bool verbose)
+{
+	if (languages->nr_entries == 0)
+		return false;
+
+	bool in = languages__in(languages, cu->language);
+
+	if ((!in && !languages->exclude) ||
+	    (in && languages->exclude)) {
+		if (verbose)
+			printf("Filtering CU %s written in %s.\n", cu->name, lang__int2str(cu->language));
+		return true;
+	}
+
+	return false;
+}
 
 static int sysfs__read_build_id(const char *filename, void *build_id, size_t size)
 {
@@ -2622,6 +2810,19 @@ static int filename__sprintf_build_id(const char *pathname, char *sbuild_id)
 static int vmlinux_path__nr_entries;
 static char **vmlinux_path;
 
+const char *vmlinux_path__btf_filename(void)
+{
+	static const char *vmlinux_btf;
+
+	if (vmlinux_btf == NULL) {
+		vmlinux_btf = getenv("PAHOLE_VMLINUX_BTF_FILENAME");
+		if (vmlinux_btf == NULL)
+			vmlinux_btf = "/sys/kernel/btf/vmlinux";
+	}
+
+	return vmlinux_btf;
+}
+
 static void vmlinux_path__exit(void)
 {
 	while (--vmlinux_path__nr_entries >= 0)
@@ -2654,6 +2855,23 @@ static int vmlinux_path__add(const char *new_entry)
 	return 0;
 }
 
+static int vmlinux_path__add_debuginfod_client(void)
+{
+	const char *home_dir = getenv("HOME");
+	if (home_dir == NULL)
+		return -1;
+
+	char running_sbuild_id[SBUILD_ID_SIZE];
+
+	if (sysfs__sprintf_build_id(NULL, running_sbuild_id) < 0)
+		return -1;
+
+	char bf[PATH_MAX];
+	snprintf(bf, sizeof(bf), "%s/.cache/debuginfod_client/%s/debuginfo", home_dir, running_sbuild_id);
+
+	return vmlinux_path__add(bf);
+}
+
 static int vmlinux_path__init(void)
 {
 	struct utsname uts;
@@ -2661,8 +2879,9 @@ static int vmlinux_path__init(void)
 	char *kernel_version;
 	unsigned int i;
 
+	// Add 1 for the debuginfod client HOME based cache
 	vmlinux_path = malloc(sizeof(char *) * (ARRAY_SIZE(vmlinux_paths) +
-			      ARRAY_SIZE(vmlinux_paths_upd)));
+						ARRAY_SIZE(vmlinux_paths_upd) + 1));
 	if (vmlinux_path == NULL)
 		return -1;
 
@@ -2680,6 +2899,8 @@ static int vmlinux_path__init(void)
 		if (vmlinux_path__add(bf) < 0)
 			goto out_fail;
 	}
+
+	vmlinux_path__add_debuginfod_client();
 
 	return 0;
 
@@ -2726,9 +2947,17 @@ const char *vmlinux_path__find_running_kernel(void)
 static int cus__load_running_kernel(struct cus *cus, struct conf_load *conf)
 {
 	int err = 0;
+	bool btf_only = false;
 
-	if ((!conf || conf->format_path == NULL || strncmp(conf->format_path, "btf", 3) == 0) &&
-	    access("/sys/kernel/btf/vmlinux", R_OK) == 0) {
+	if (!conf || conf->format_path == NULL)
+		goto try_btf;
+
+	if (!strstr(conf->format_path, "btf"))
+		goto try_elf;
+
+	btf_only = strcmp(conf->format_path, "btf") == 0;
+try_btf:
+	if (access(vmlinux_path__btf_filename(), R_OK) == 0) {
 		int loader = debugging_formats__loader("btf");
 		if (loader == -1)
 			goto try_elf;
@@ -2736,10 +2965,13 @@ static int cus__load_running_kernel(struct cus *cus, struct conf_load *conf)
 		if (conf && conf->conf_fprintf)
 			conf->conf_fprintf->has_alignment_info = debug_fmt_table[loader]->has_alignment_info;
 
-		if (debug_fmt_table[loader]->load_file(cus, conf, "/sys/kernel/btf/vmlinux") == 0)
+		if (debug_fmt_table[loader]->load_file(cus, conf, vmlinux_path__btf_filename()) == 0)
 			return 0;
 	}
 try_elf:
+	if (btf_only)
+		return -1;
+
 	elf_version(EV_CURRENT);
 	vmlinux_path__init();
 

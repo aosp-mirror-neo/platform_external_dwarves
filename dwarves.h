@@ -8,6 +8,7 @@
 */
 
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <obstack.h>
@@ -92,6 +93,7 @@ struct conf_load {
 	bool			btf_gen_optimized;
 	bool			skip_encoding_btf_inconsistent_proto;
 	bool			skip_encoding_btf_vars;
+	bool			encode_btf_global_vars;
 	bool			btf_gen_floats;
 	bool			btf_encode_force;
 	bool			reproducible_build;
@@ -288,7 +290,7 @@ struct cu {
 	struct ptr_table functions_table;
 	struct ptr_table tags_table;
 	struct rb_root	 functions;
-	char		 *name;
+	const char	 *name;
 	char		 *filename;
 	void 		 *priv;
 	struct debug_fmt_ops *dfops;
@@ -350,6 +352,19 @@ static inline __pure bool cu__is_c(const struct cu *cu)
 }
 
 int lang__str2int(const char *lang);
+const char *lang__int2str(int lang);
+
+struct languages {
+	char *str;
+	int  *entries;
+	int  nr_entries;
+	bool exclude;
+};
+
+int languages__init(struct languages *languages, const char *tool);
+int languages__parse(struct languages *languages, const char *tool);
+bool languages__in(struct languages *languages, int lang);
+bool languages__cu_filtered(struct languages *languages, struct cu *cu, bool verbose);
 
 /**
  * cu__for_each_cached_symtab_entry - iterate thru the cached symtab entries
@@ -848,6 +863,8 @@ struct variable {
 	uint8_t		 external:1;
 	uint8_t		 declaration:1;
 	uint8_t		 has_specification:1;
+	uint8_t		 artificial:1;
+	uint8_t		 top_level:1;
 	enum vscope	 scope;
 	struct location	 location;
 	struct hlist_node tool_hnode;
@@ -1408,6 +1425,10 @@ struct class {
 	uint8_t		 pre_bit_hole;
 	uint8_t		 bit_padding;
 	bool		 holes_searched;
+	bool		 flexible_array_verified;
+	bool		 embedded_flexible_array_searched;
+	bool		 has_flexible_array;
+	bool		 has_embedded_flexible_array;
 	bool		 is_packed;
 	void		 *priv;
 };
@@ -1450,6 +1471,8 @@ static inline int class__is_struct(const struct class *cls)
 	return tag__is_struct(&cls->type.namespace.tag);
 }
 
+bool class__has_embedded_flexible_array(struct class *cls, const struct cu *cu);
+bool class__has_flexible_array(struct class *class, const struct cu *cu);
 void class__find_holes(struct class *cls);
 int class__has_hole_ge(const struct class *cls, const uint16_t size);
 
@@ -1604,6 +1627,8 @@ void dwarves__exit(void);
 void dwarves__resolve_cacheline_size(const struct conf_load *conf, uint16_t user_cacheline_size);
 
 const char *dwarf_tag_name(const uint32_t tag);
+
+const char *vmlinux_path__btf_filename(void);
 
 const char *vmlinux_path__find_running_kernel(void);
 
