@@ -11,7 +11,7 @@ third_party {
     type: GIT
     value: "https://git.kernel.org/pub/scm/devel/pahole/pahole"
   }
-  version: "37e3bf08e0314efa08ba88600f07adf0079c987d"
-  last_upgrade_date { year: 2023 month: 10 day: 17 }
+  version: "1f2805b6eef104df3125143c949b391f6122e5b9"
+  last_upgrade_date { year: 2026 month: 4 day: 8 }
   license_type: RESTRICTED
 }
