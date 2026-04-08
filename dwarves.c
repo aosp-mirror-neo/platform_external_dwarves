@@ -210,6 +210,9 @@ void tag__delete(struct tag *tag, struct cu *cu)
 
 	assert(list_empty(&tag->node));
 
+	if (tag->attributes)
+		free(tag->attributes);
+
 	switch (tag->tag) {
 	case DW_TAG_union_type:
 		type__delete(tag__type(tag), cu);		break;
@@ -530,48 +533,6 @@ void cus__unlock(struct cus *cus)
 	pthread_mutex_unlock(&cus->mutex);
 }
 
-void cus__set_cu_state(struct cus *cus, struct cu *cu, enum cu_state state)
-{
-	cus__lock(cus);
-	cu->state = state;
-	cus__unlock(cus);
-}
-
-// Used only when reproducible builds are desired
-struct cu *cus__get_next_processable_cu(struct cus *cus)
-{
-	struct cu *cu;
-
-	cus__lock(cus);
-
-	list_for_each_entry(cu, &cus->cus, node) {
-		switch (cu->state) {
-		case CU__LOADED:
-			cu->state = CU__PROCESSING;
-			goto found;
-		case CU__PROCESSING:
-			// This will happen when we get to parallel
-			// reproducible BTF encoding, libbpf dedup work needed
-			// here. The other possibility is when we're flushing
-			// the DWARF processed CUs when the parallel DWARF
-			// loading stoped and we still have CUs to encode to
-			// BTF because of ordering requirements.
-			continue;
-		case CU__UNPROCESSED:
-			// The first entry isn't loaded, signal the
-			// caller to return and try another day, as we
-			// need to respect the original DWARF CU ordering.
-			goto out;
-		}
-	}
-out:
-	cu = NULL;
-found:
-	cus__unlock(cus);
-
-	return cu;
-}
-
 bool cus__empty(const struct cus *cus)
 {
 	return list_empty(&cus->cus);
@@ -764,6 +725,8 @@ int cu__fprintf_ptr_table_stats_csv(struct cu *cu, FILE *fp)
 	return printed;
 }
 
+#define OBSTACK_CHUNK_SIZE (128*1024)
+
 struct cu *cu__new(const char *name, uint8_t addr_size,
 		   const unsigned char *build_id, int build_id_len,
 		   const char *filename, bool use_obstack)
@@ -775,7 +738,7 @@ struct cu *cu__new(const char *name, uint8_t addr_size,
 
 		cu->use_obstack = use_obstack;
 		if (cu->use_obstack)
-			obstack_init(&cu->obstack);
+			obstack_begin(&cu->obstack, OBSTACK_CHUNK_SIZE);
 
 		if (name == NULL || filename == NULL)
 			goto out_free;
@@ -807,8 +770,6 @@ struct cu *cu__new(const char *name, uint8_t addr_size,
 
 		cu->addr_size = addr_size;
 		cu->extra_dbg_info = 0;
-
-		cu->state = CU__UNPROCESSED;
 
 		cu->nr_inline_expansions   = 0;
 		cu->size_inline_expansions = 0;
