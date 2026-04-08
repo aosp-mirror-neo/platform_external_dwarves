@@ -60,10 +60,13 @@ static char *decl_exclude_prefix;
 static size_t decl_exclude_prefix_len;
 
 static uint16_t nr_holes;
+static uint16_t end_padding;
+static uint16_t end_padding_ge;
 static uint16_t nr_bit_holes;
 static uint16_t hole_size_ge;
 static uint8_t show_packable;
 static bool show_with_flexible_array;
+static bool show_with_embedded_flexible_array;
 static uint8_t global_verbose;
 static uint8_t recursive;
 static size_t cacheline_size;
@@ -129,78 +132,7 @@ static struct rb_root structures__tree = RB_ROOT;
 static LIST_HEAD(structures__list);
 static pthread_mutex_t structures_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static struct {
-	char *str;
-	int  *entries;
-	int  nr_entries;
-	bool exclude;
-} languages;
-
-static int lang_id_cmp(const void *pa, const void *pb)
-{
-	int a = *(int *)pa,
-	    b = *(int *)pb;
-	return a - b;
-}
-
-static int parse_languages(void)
-{
-	int nr_allocated = 4;
-	char *lang = languages.str;
-
-	languages.entries = zalloc(sizeof(int) * nr_allocated);
-	if (languages.entries == NULL)
-		goto out_enomem;
-
-	while (1) {
-		char *sep = strchr(lang, ',');
-
-		if (sep)
-			*sep = '\0';
-
-		int id = lang__str2int(lang);
-
-		if (sep)
-			*sep = ',';
-
-		if (id < 0) {
-			fprintf(stderr, "pahole: unknown language \"%s\"\n", lang);
-			goto out_free;
-		}
-
-		if (languages.nr_entries >= nr_allocated) {
-			nr_allocated *= 2;
-			int *entries = realloc(languages.entries, nr_allocated);
-
-			if (entries == NULL)
-				goto out_enomem;
-
-			languages.entries = entries;
-		}
-
-		languages.entries[languages.nr_entries++] = id;
-
-		if (!sep)
-			break;
-
-		lang = sep + 1;
-	}
-
-	qsort(languages.entries, languages.nr_entries, sizeof(int), lang_id_cmp);
-
-	return 0;
-out_enomem:
-	fprintf(stderr, "pahole: not enough memory to parse --lang\n");
-out_free:
-	zfree(&languages.entries);
-	languages.nr_entries = 0;
-	return -1;
-}
-
-static bool languages__in(int lang)
-{
-	return bsearch(&lang, languages.entries, languages.nr_entries, sizeof(int), lang_id_cmp) != NULL;
-}
+static struct languages languages;
 
 static int type__compare_members_types(struct type *a, struct cu *cu_a, struct type *b, struct cu *cu_b)
 {
@@ -684,13 +616,8 @@ static void print_ordered_classes(void)
 
 static struct cu *cu__filter(struct cu *cu)
 {
-	if (languages.nr_entries) {
-		bool in = languages__in(cu->language);
-
-		if ((!in && !languages.exclude) ||
-		    (in && languages.exclude))
-			return NULL;
-	}
+	if (languages__cu_filtered(&languages, cu, global_verbose))
+		return NULL;
 
 	if (cu__exclude_prefix != NULL &&
 	    (cu->name == NULL ||
@@ -718,29 +645,6 @@ static int class__packable(struct class *class, struct cu *cu)
 	}
 	class__delete(clone, cu);
 	return 0;
-}
-
-static bool class__has_flexible_array(struct class *class, struct cu *cu)
-{
-	struct class_member *member = type__last_member(&class->type);
-
-	if (member == NULL)
-		return false;
-
-	struct tag *type = cu__type(cu, member->tag.type);
-
-	if (type->tag != DW_TAG_array_type)
-		return false;
-
-	struct array_type *array = tag__array_type(type);
-
-	if (array->dimensions > 1)
-		return false;
-
-	if (array->nr_entries == NULL || array->nr_entries[0] == 0)
-		return true;
-
-	return false;
 }
 
 static struct class *class__filter(struct class *class, struct cu *cu,
@@ -824,13 +728,16 @@ static struct class *class__filter(struct class *class, struct cu *cu,
 	 * that need finding holes, like --packable, --nr_holes, etc
 	 */
 	if (!tag__is_struct(tag))
-		return (just_structs || show_packable || nr_holes || nr_bit_holes || hole_size_ge) ? NULL : class;
+		return (just_structs || show_packable || nr_holes || nr_bit_holes || hole_size_ge ||
+			end_padding_ge || end_padding) ? NULL : class;
 
 	if (tag->top_level)
 		class__find_holes(class);
 
 	if (class->nr_holes < nr_holes ||
+	    class->padding < end_padding_ge ||
 	    class->nr_bit_holes < nr_bit_holes ||
+	    (end_padding != 0 && class->padding != end_padding) ||
 	    (hole_size_ge != 0 && !class__has_hole_ge(class, hole_size_ge)))
 		return NULL;
 
@@ -838,6 +745,9 @@ static struct class *class__filter(struct class *class, struct cu *cu,
 		return NULL;
 
 	if (show_with_flexible_array && !class__has_flexible_array(class, cu))
+		return NULL;
+
+	if (show_with_embedded_flexible_array && !class__has_embedded_flexible_array(class, cu))
 		return NULL;
 
 	return class;
@@ -1239,6 +1149,9 @@ ARGP_PROGRAM_VERSION_HOOK_DEF = dwarves_print_version;
 #define ARGP_contains_enumerator 344
 #define ARGP_reproducible_build 345
 #define ARGP_running_kernel_vmlinux 346
+#define ARG_padding_ge		   347
+#define ARG_padding		   348
+#define ARGP_with_embedded_flexible_array 349
 
 /* --btf_features=feature1[,feature2,..] allows us to specify
  * a list of requested BTF features or "default" to enable all default
@@ -1293,7 +1206,10 @@ struct btf_feature {
 	BTF_DEFAULT_FEATURE(consistent_func, skip_encoding_btf_inconsistent_proto, false),
 	BTF_DEFAULT_FEATURE(decl_tag_kfuncs, btf_decl_tag_kfuncs, false),
 	BTF_NON_DEFAULT_FEATURE(reproducible_build, reproducible_build, false),
+#if LIBBPF_MAJOR_VERSION >= 1 && LIBBPF_MINOR_VERSION >= 5
 	BTF_NON_DEFAULT_FEATURE(distilled_base, btf_gen_distilled_base, false),
+#endif
+	BTF_NON_DEFAULT_FEATURE(global_var, encode_btf_global_vars, false),
 };
 
 #define BTF_MAX_FEATURE_STR	1024
@@ -1495,6 +1411,12 @@ static const struct argp_option pahole__options[] = {
 		.doc  = "show only structs with at least NR_HOLES holes",
 	},
 	{
+		.name = "padding_ge",
+		.key  = ARG_padding_ge,
+		.arg  = "SIZE_PADDING",
+		.doc  = "show only structs with at least SIZE_PADDING bytes padding at its end",
+	},
+	{
 		.name = "hole_size_ge",
 		.key  = 'z',
 		.arg  = "HOLE_SIZE",
@@ -1510,6 +1432,11 @@ static const struct argp_option pahole__options[] = {
 		.name = "with_flexible_array",
 		.key  = ARGP_with_flexible_array,
 		.doc  = "show only structs with a flexible array",
+	},
+	{
+		.name = "with_embedded_flexible_array",
+		.key  = ARGP_with_embedded_flexible_array,
+		.doc  = "show only structs with an embedded flexible array (contaning a struct that has a flexible array)",
 	},
 	{
 		.name = "expand_types",
@@ -1720,7 +1647,7 @@ static const struct argp_option pahole__options[] = {
 	{
 		.name = "skip_encoding_btf_vars",
 		.key  = ARGP_skip_encoding_btf_vars,
-		.doc  = "Do not encode VARs in BTF."
+		.doc  = "Do not encode any VARs in BTF [if this is not specified, only percpu variables are encoded. To encode global variables too, use --encode_btf_global_vars]."
 	},
 	{
 		.name = "btf_encode_force",
@@ -1885,6 +1812,8 @@ static error_t pahole__options_parser(int key, char *arg,
 		  class_name = arg;			break;
 	case 'F': conf_load.format_path = arg;		break;
 	case 'H': nr_holes = atoi(arg);			break;
+	case ARG_padding: end_padding = atoi(arg);	break;
+	case ARG_padding_ge: end_padding_ge = atoi(arg); break;
 	case 'I': conf.show_decl_info = 1;
 		  conf_load.extra_dbg_info = 1;		break;
 	case 'i': find_containers = 1;
@@ -2010,6 +1939,9 @@ static error_t pahole__options_parser(int key, char *arg,
 		parse_btf_features("all", false);	break;
 	case ARGP_with_flexible_array:
 		show_with_flexible_array = true;	break;
+	case ARGP_with_embedded_flexible_array:
+		just_structs = true;
+		show_with_embedded_flexible_array = true; break;
 	case ARGP_prettify_input_filename:
 		prettify_input_filename = arg;		break;
 	case ARGP_sort_output:
@@ -3731,7 +3663,7 @@ int main(int argc, char *argv[])
 		return rc;
 	}
 
-	if (languages.str && parse_languages())
+	if (languages__init(&languages, "pahole"))
 		return rc;
 
 	if (class_name != NULL && stats_formatter == nr_methods_formatter) {
@@ -3822,7 +3754,7 @@ try_sole_arg_as_class_names:
 		if (filename &&
 		    strstarts(filename, "/sys/kernel/btf/") &&
 		    strstr(filename, "/vmlinux") == NULL) {
-			base_btf_file = "/sys/kernel/btf/vmlinux";
+			base_btf_file = vmlinux_path__btf_filename();
 			conf_load.base_btf = btf__parse(base_btf_file, NULL);
 			if (libbpf_get_error(conf_load.base_btf)) {
 				fprintf(stderr, "Failed to parse base BTF '%s': %ld\n",
@@ -3850,7 +3782,14 @@ try_sole_arg_as_class_names:
 			remaining = argc;
 			goto try_sole_arg_as_class_names;
 		}
-		cus__fprintf_load_files_err(cus, "pahole", argv + remaining, err, stderr);
+		if (argv[remaining] != NULL) {
+			cus__fprintf_load_files_err(cus, "pahole", argv + remaining, err, stderr);
+		} else {
+			fprintf(stderr, "pahole: couldn't find any%s%s debug information on this system.\n",
+					conf_load.format_path ? " " : "",
+					conf_load.format_path ?: "");
+		}
+
 		goto out_cus_delete;
 	}
 

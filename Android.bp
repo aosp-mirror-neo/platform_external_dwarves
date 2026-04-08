@@ -17,7 +17,7 @@ cc_defaults {
     defaults: ["elfutils_transitive_defaults"],
     cflags: [
         "-DDWARVES_MAJOR_VERSION=1",
-        "-DDWARVES_MINOR_VERSION=27",
+        "-DDWARVES_MINOR_VERSION=28",
         "-D_GNU_SOURCE",
         "-Wno-deprecated-declarations",
         "-Wno-pointer-arith",
